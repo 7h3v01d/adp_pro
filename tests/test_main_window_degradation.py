@@ -38,8 +38,12 @@ def test_app_boots_without_libtorrent(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.__import__", blocking_import)
     # torrent_panel/engine modules are already imported+cached from earlier
     # tests in this session; force them to re-evaluate under the blocked
-    # import so main_window's fallback path actually gets exercised.
-    for mod_name in ["adp.torrent.engine", "adp.gui.torrent_panel", "adp.gui.main_window"]:
+    # import so main_window's fallback path actually gets exercised. The
+    # TORRENT_SUPPORT_AVAILABLE flag lives in the .window submodule (the
+    # package was split), so that must be dropped too, not just the package.
+    for mod_name in ["adp.torrent.engine", "adp.gui.torrent_panel",
+                     "adp.gui.main_window", "adp.gui.main_window.window",
+                     "adp.gui.main_window.download_panel"]:
         sys.modules.pop(mod_name, None)
 
     try:
