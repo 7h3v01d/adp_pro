@@ -1,4 +1,4 @@
-# Accelerated Downloader Pro
+# ADP Pro
 
 A multi-threaded, resumable download manager with a PyQt6 "Pro" GUI:
 categories, search/filter, per-download speed limits, scheduling,
