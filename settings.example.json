@@ -1,0 +1,29 @@
+{
+  "__comment__": "REFERENCE ONLY -- the app does NOT read this file. At runtime it reads (and writes) settings.json in the per-user app-data dir: Windows %APPDATA%\\AcceleratedDownloaderPro\\settings.json, macOS ~/Library/Application Support/AcceleratedDownloaderPro/, Linux $XDG_DATA_HOME/AcceleratedDownloaderPro/. Any key you omit there falls back to the built-in default shown here. Edit settings in the app's Settings dialog; this file just documents the shape.",
+
+  "theme": "dark",
+  "default_speed_limit_bps": 0,
+  "verify_tls": true,
+  "minimize_to_tray": true,
+  "notifications_enabled": true,
+  "clipboard_monitor_enabled": false,
+
+  "torrent_listen_port": 6881,
+  "torrent_enable_dht": true,
+  "torrent_default_seed_ratio_limit": 0.0,
+
+  "api_port": 8765,
+
+  "download_dir": "",
+  "torrent_download_dir": "",
+
+  "search_providers": {
+    "torrents_csv": { "enabled": true },
+    "jackett": {
+      "enabled": false,
+      "base_url": "http://127.0.0.1:9117",
+      "api_key": "",
+      "indexer": "all"
+    }
+  }
+}

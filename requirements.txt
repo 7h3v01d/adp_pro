@@ -1,0 +1,7 @@
+PyQt6>=6.5
+requests>=2.31
+urllib3>=2.0
+libtorrent>=2.0
+fastapi>=0.115
+uvicorn>=0.30
+mcp>=1.2

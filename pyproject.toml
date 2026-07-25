@@ -1,0 +1,36 @@
+[project]
+name = "accelerated-downloader-pro"
+version = "2.0.0"
+description = "A multi-threaded, resumable download manager with a PyQt6 Pro GUI."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "PyQt6>=6.5",
+    "requests>=2.31",
+    "urllib3>=2.0",
+    "libtorrent>=2.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-qt>=4.2",
+    "pytest-mock>=3.11",
+    "pytest-timeout>=2.1",
+]
+browser-rig = [
+    "PyQt6-WebEngine>=6.5",
+]
+
+[project.scripts]
+adp-downloader = "adp.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

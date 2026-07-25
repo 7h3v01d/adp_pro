@@ -1,0 +1,7 @@
+{
+    "theme": "dark",
+    "default_speed_limit_bps": 0,
+    "minimize_to_tray": true,
+    "notifications_enabled": true,
+    "clipboard_monitor_enabled": false
+}
