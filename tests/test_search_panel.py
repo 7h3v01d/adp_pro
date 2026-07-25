@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Search tab GUI tests -- worker threading, table population, and the
 add-to-torrents path. No real network: the service gets stub providers.
 """

@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """JSON-backed storage for lifetime (cross-restart) statistics: total bytes
 ever downloaded/uploaded and total completed transfers. Kept separate from
 AppSettingsStore since these are counters, not preferences.
 """
+
 from __future__ import annotations
 
 import json

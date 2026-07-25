@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """HTTP error messaging: describe_http_error() plus the end-to-end metadata
 403 path (the link.testfile.org field report).
 """

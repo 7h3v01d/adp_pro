@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """MCP (Model Context Protocol) server for Accelerated Downloader Pro.
 
 Exposes the exact same operations as the REST API, via mcp.server.fastmcp,
@@ -11,6 +13,7 @@ Every tool is a thin wrapper that calls the SAME AppController method the
 REST API calls, so there is exactly one implementation of "what does
 add_download mean" regardless of which interface a caller used.
 """
+
 from __future__ import annotations
 
 from typing import Optional

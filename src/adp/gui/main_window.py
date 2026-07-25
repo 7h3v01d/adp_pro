@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 import sys
 import os
 import subprocess
@@ -36,7 +38,7 @@ except ImportError as e:
 from adp.gui.stats_panel import StatsPanel
 from adp.gui.search_panel import SearchPanel
 from adp.search.service import SearchService
-from adp.core.storage import resolve_dir
+from adp.core.storage import resolve_dir, ConfiguredPathUnavailableError
 
 from adp.api.auth import ApiKeyStore
 from adp.api.bridge import GuiBridge
@@ -135,10 +137,16 @@ class DownloadPanel(QWidget):
         event.acceptProposedAction()
 
     def _prompt_add_for_dropped_url(self, url):
+        try:
+            default_dir = self._download_dir()
+        except ConfiguredPathUnavailableError as e:
+            self.status_update_requested.emit(
+                f"Download folder unavailable: {e}. Fix it in Settings.", 8000)
+            return
         dialog = AddDownloadDialog(self, thread_pool=self.thread_pool,
                                     default_speed_limit_bps=self.settings.get("default_speed_limit_bps", 0),
                                     default_verify_tls=self.settings.get("verify_tls", True),
-                                    default_dir=self._download_dir())
+                                    default_dir=default_dir)
         dialog.url_input.setText(url)
         if dialog.exec():
             data = dialog.get_data()
@@ -223,7 +231,7 @@ class DownloadPanel(QWidget):
     # -- add / start -------------------------------------------------------
     def add_download(self, url, save_path, checksum=None, num_threads=4, start_immediately=True,
                       headers=None, category=None, speed_limit_bps=0, scheduled_time=None,
-                      verify_tls=None):
+                      verify_tls=None, download_id=None):
         if not (url and save_path):
             return None, None
 
@@ -235,7 +243,10 @@ class DownloadPanel(QWidget):
             )
             return None, None
 
-        download_id = str(uuid.uuid4())
+        # Preserve the id across a restart when restoring from session, so
+        # external controllers (REST/MCP) and the .progress sidecar keep
+        # referring to the same download. New downloads get a fresh uuid.
+        download_id = download_id or str(uuid.uuid4())
         category = category or category_for_filename(os.path.basename(save_path))
         item_widget = DownloadItemWidget(download_id, save_path, category=category)
         list_item = QListWidgetItem(self.download_list)
@@ -291,16 +302,24 @@ class DownloadPanel(QWidget):
             self._on_schedule_due(download_id)
 
     def _download_dir(self) -> str:
-        """The resolved default download folder: the user's configured
-        download_dir when set and usable, else a Downloads folder under the
-        state dir. Falls back gracefully if the configured drive is gone."""
+        """The resolved default download folder for the Add dialog: the user's
+        configured download_dir when set and usable, else a Downloads folder
+        under the state dir. Raises ConfiguredPathUnavailableError if the user
+        configured a location that's currently unreachable -- the caller shows
+        that to the user rather than silently redirecting to the system drive."""
         return resolve_dir(self.settings.get("download_dir"),
                             os.path.join(self.state_dir, "downloads"))
 
     def add_download_from_dialog(self):
+        try:
+            default_dir = self._download_dir()
+        except ConfiguredPathUnavailableError as e:
+            self.status_update_requested.emit(
+                f"Download folder unavailable: {e}. Fix it in Settings.", 8000)
+            return
         dialog = AddDownloadDialog(self, thread_pool=self.thread_pool,
                                     default_speed_limit_bps=self.settings.get("default_speed_limit_bps", 0),
-                                    default_dir=self._download_dir())
+                                    default_dir=default_dir)
         if dialog.exec():
             data = dialog.get_data()
             self.add_download(**data)
@@ -410,12 +429,21 @@ class DownloadPanel(QWidget):
 
     def retry_selected_download(self):
         download_id = self.get_selected_download_id()
-        if download_id and download_id in self.downloads:
-            manager = self.downloads[download_id]
-            if manager.status in [Status.ERROR, Status.STOPPED, Status.COMPLETED]:
-                self.download_queue.append(manager)
-                self.process_queue()
-                manager.retry()
+        if not (download_id and download_id in self.downloads):
+            return
+        manager = self.downloads[download_id]
+        if manager.status not in (Status.ERROR, Status.STOPPED, Status.COMPLETED):
+            return
+        # Reset to PENDING and let process_queue be the single owner of
+        # starting downloads and incrementing active_downloads. Previously
+        # this both queued the manager AND called manager.retry() directly:
+        # process_queue would drop the non-PENDING manager without starting
+        # or counting it, and the direct start ran it *outside* the
+        # concurrency limit -- and a COMPLETED retry did nothing at all.
+        manager.prepare_retry()
+        if manager not in self.download_queue:
+            self.download_queue.append(manager)
+        self.process_queue()
 
     def remove_selected_download(self):
         selected_items = self.download_list.selectedItems()
@@ -464,30 +492,56 @@ class DownloadPanel(QWidget):
                 self.status_update_requested.emit(f"Could not open folder: {e}", 5000)
 
     # -- persistence -----------------------------------------------------------
+    # States that can't meaningfully resume are stored as-is; the two active
+    # states are stored as recoverable equivalents so a restart genuinely
+    # picks them back up (the .progress sidecar on disk lets them continue
+    # from where they left off rather than restarting).
+    _RESTORE_STATUS_MAP = {
+        Status.DOWNLOADING: Status.PENDING,
+        Status.STARTING: Status.PENDING,
+        Status.PAUSED: Status.PAUSED,
+    }
+
     def save_downloads(self):
         records = []
         all_downloads = list(self.downloads.values()) + list(self.download_queue)
         for manager in {m.download_id: m for m in all_downloads}.values():
-            if manager.status not in [Status.DOWNLOADING, Status.PAUSED]:
-                scheduled = self.scheduler.scheduled_time(manager.download_id)
-                records.append(DownloadRecord(
-                    download_id=manager.download_id, url=manager.url, save_path=manager.save_path,
-                    checksum=manager.checksum, num_threads=manager.num_threads, headers=manager.headers,
-                    category=manager.category, speed_limit_bps=manager.speed_limiter.rate,
-                    scheduled_time=scheduled.isoformat() if scheduled else None,
-                    status=manager.status.name, downloaded_size=manager.downloaded_size,
-                    total_size=manager.total_size,
-                ))
+            # Persist everything except downloads the user has removed. Active
+            # (DOWNLOADING/STARTING) jobs are recorded as recoverable so they
+            # actually come back on restart -- the whole point of the feature.
+            store_status = self._RESTORE_STATUS_MAP.get(manager.status, manager.status)
+            scheduled = self.scheduler.scheduled_time(manager.download_id)
+            records.append(DownloadRecord(
+                download_id=manager.download_id, url=manager.url, save_path=manager.save_path,
+                checksum=manager.checksum, num_threads=manager.num_threads, headers=manager.headers,
+                category=manager.category, speed_limit_bps=manager.speed_limiter.rate,
+                scheduled_time=scheduled.isoformat() if scheduled else None,
+                status=store_status.name, downloaded_size=manager.downloaded_size,
+                total_size=manager.total_size,
+            ))
         self.session_store.save(records)
 
     def load_downloads(self):
         for record in self.session_store.load():
+            # Restore with the ORIGINAL id so the .progress sidecar and any
+            # external controllers still line up. A job saved as PAUSED is
+            # restored paused; a recoverable (formerly active) job is restored
+            # pending and resumes automatically via process_queue().
+            restore_paused = (record.status == Status.PAUSED.name)
             self.add_download(
                 url=record.url, save_path=record.save_path, checksum=record.checksum,
                 num_threads=record.num_threads, headers=record.headers, category=record.category,
                 speed_limit_bps=record.speed_limit_bps, scheduled_time=record.scheduled_time,
-                start_immediately=False,
+                start_immediately=False, download_id=record.download_id,
             )
+            if restore_paused:
+                manager = self.downloads.get(record.download_id)
+                if manager is not None:
+                    # Keep it paused rather than auto-queuing it: the user
+                    # paused it, that intent should survive the restart.
+                    if manager in self.download_queue:
+                        self.download_queue.remove(manager)
+                    manager.set_status(Status.PAUSED)
         self.process_queue()
 
     def apply_settings(self, new_settings: dict):
@@ -522,10 +576,19 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.download_panel, "Downloads")
 
         if TORRENT_SUPPORT_AVAILABLE:
-            torrent_dir = resolve_dir(
-                settings.get("torrent_download_dir"),
-                os.path.join(state_dir, "torrent_downloads"),
-            )
+            default_torrent_dir = os.path.join(state_dir, "torrent_downloads")
+            try:
+                torrent_dir = resolve_dir(
+                    settings.get("torrent_download_dir"), default_torrent_dir)
+            except ConfiguredPathUnavailableError as e:
+                # At construction there's no status bar yet and we must not
+                # crash startup. Fall back to the default location but log
+                # loudly; the user will also see the failure the next time
+                # they open Settings or add a torrent.
+                logger.warning("Configured torrent folder unavailable at startup, "
+                               "using default: %s", e)
+                os.makedirs(default_torrent_dir, exist_ok=True)
+                torrent_dir = default_torrent_dir
             self.torrent_panel = TorrentPanel(
                 self, state_dir=state_dir,
                 listen_port=settings.get("torrent_listen_port", 6881),
@@ -650,10 +713,14 @@ class MainWindow(QMainWindow):
             # download folder is read fresh from settings each time the Add
             # dialog opens, so it needs no explicit push here.
             if self.torrent_panel is not None:
-                self.torrent_panel.set_default_save_path(resolve_dir(
-                    new_settings.get("torrent_download_dir"),
-                    os.path.join(self.download_panel.state_dir, "torrent_downloads"),
-                ))
+                try:
+                    new_torrent_dir = resolve_dir(
+                        new_settings.get("torrent_download_dir"),
+                        os.path.join(self.download_panel.state_dir, "torrent_downloads"))
+                    self.torrent_panel.set_default_save_path(new_torrent_dir)
+                except ConfiguredPathUnavailableError as e:
+                    self.statusBar().showMessage(
+                        f"Torrent folder unavailable: {e}. Existing folder kept.", 8000)
 
     def apply_theme(self, theme_name: str):
         app = QApplication.instance()

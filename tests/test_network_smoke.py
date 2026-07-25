@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Smoke tests that hit the real internet to sanity-check the engine against
 an actual HTTPS server -- real TLS, real redirects, real range support --
 rather than the in-process mock. Excluded from the default run: `pytest -m

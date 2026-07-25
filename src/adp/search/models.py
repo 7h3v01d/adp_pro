@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Data types for the torrent search subsystem.
 
 Every provider, whatever its upstream shape, normalizes into these types.
@@ -8,6 +10,7 @@ Kept separate from torrent/models.py deliberately: a search result is a
 candidate (may not even have resolved metadata), a TorrentRecord is a
 commitment the engine is managing.
 """
+
 from __future__ import annotations
 
 import re

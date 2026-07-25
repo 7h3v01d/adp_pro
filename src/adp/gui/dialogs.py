@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
+import copy
 import os
 from datetime import datetime, timedelta
 
@@ -128,7 +131,12 @@ class AddDownloadDialog(QDialog):
             f"File Info: {format_size(total_size)} | Server supports ranges: {accept_ranges == 'bytes'}"
         )
         if filename and not self.path_input.text():
-            self.path_input.setText(os.path.join(os.getcwd(), filename))
+            # Land the auto-filled name in the user's configured download
+            # folder when there is one, not the process working directory
+            # (which is wherever the app happened to be launched from -- the
+            # whole reason the storage config exists).
+            base_dir = self.default_dir or os.getcwd()
+            self.path_input.setText(os.path.join(base_dir, filename))
         if filename and self._category_auto_set:
             guessed = category_for_filename(filename)
             idx = self.category_input.findText(guessed)
@@ -206,6 +214,12 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.setMinimumWidth(360)
         settings = current_settings or {}
+        # Keep a deep copy of everything we were given. get_settings() merges
+        # the dialog's known keys over this, so keys the dialog doesn't expose
+        # as widgets -- search_providers (incl. the user's Jackett API key),
+        # api_port, and any future setting -- survive a Settings round-trip
+        # instead of being silently dropped and wiped on save.
+        self._original_settings = copy.deepcopy(dict(settings))
 
         layout = QFormLayout(self)
 
@@ -334,7 +348,12 @@ class SettingsDialog(QDialog):
             torrent_seed_ratio = float(self.torrent_seed_ratio_input.text().strip() or 0.0)
         except ValueError:
             torrent_seed_ratio = 0.0
-        return {
+        # Start from everything we were given and overlay only the keys this
+        # dialog owns. Anything the dialog doesn't expose (search_providers,
+        # api_port, future keys) passes through untouched rather than being
+        # dropped on save.
+        merged = copy.deepcopy(self._original_settings)
+        merged.update({
             "theme": self.theme_input.currentData(),
             "verify_tls": self.verify_tls_checkbox.isChecked(),
             "download_dir": self.download_dir_input.text().strip(),
@@ -346,7 +365,8 @@ class SettingsDialog(QDialog):
             "torrent_listen_port": self.torrent_listen_port_input.value(),
             "torrent_enable_dht": self.torrent_dht_checkbox.isChecked(),
             "torrent_default_seed_ratio_limit": torrent_seed_ratio,
-        }
+        })
+        return merged
 
 
 class ApiInfoDialog(QDialog):

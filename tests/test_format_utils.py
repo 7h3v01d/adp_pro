@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 import pytest
 
 from adp.utils.format import format_size, format_speed, format_eta, parse_size_to_bytes

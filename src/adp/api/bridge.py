@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Bridges background threads (the REST/MCP API servers) into the Qt main
 thread, where DownloadPanel/TorrentPanel/StatsPanel and everything they own
 actually live.
@@ -12,6 +14,7 @@ queue and runs each callable directly (safe, since by construction it's
 now executing on the same thread the GUI objects live on), then unblocks
 the waiting caller with the result or a re-raised exception.
 """
+
 from __future__ import annotations
 
 import queue

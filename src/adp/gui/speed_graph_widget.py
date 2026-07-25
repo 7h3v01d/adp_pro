@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """A lightweight, dependency-free rolling line graph for download/upload
 speed, drawn with QPainter rather than pulling in a charting library --
 consistent with the rest of this app's philosophy of avoiding extra native
 dependencies where a straightforward custom widget will do.
 """
+
 from __future__ import annotations
 
 from collections import deque

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Core, GUI-independent download engine.
 
 Design notes:
@@ -9,7 +11,9 @@ Design notes:
 - Per-chunk progress is persisted to a `<file>.progress` sidecar so downloads
   can resume after a crash or restart.
 """
+
 import os
+import re
 import time
 import requests
 import hashlib
@@ -38,11 +42,25 @@ BROWSER_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,'
               'image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
+    # Identity, deliberately: this is a resumable *byte-range* engine, and an
+    # HTTP byte range refers to bytes of the *selected representation*. If the
+    # server compresses the response, our filesystem offsets (raw bytes) and
+    # the range offsets (compressed bytes) stop corresponding, and requests'
+    # transparent decoding can splice mismatched data. Correctness beats the
+    # few saved bytes on compressible files. Applies to metadata probes and
+    # ranged GETs alike.
+    'Accept-Encoding': 'identity',
     'Connection': 'keep-alive',
 }
 
 CHUNK_READ_SIZE = 8192
+
+
+class RangeNotHonoredError(requests.RequestException):
+    """Raised when a server answers a Range request with something other than a
+    valid 206 partial response. A RequestException subclass so it flows through
+    the worker's existing error handling and fails the download loudly rather
+    than corrupting the output file."""
 
 
 def describe_http_error(exc: "requests.RequestException") -> str:
@@ -131,7 +149,7 @@ class DownloadWorker(QRunnable):
 
     def __init__(self, manager, url, file_path, start_byte, end_byte, headers,
                  speed_limiter: Optional[SpeedLimiter] = None, session_factory=None,
-                 epoch: int = 0, verify_tls: bool = True):
+                 epoch: int = 0, verify_tls: bool = True, ranges_supported: bool = True):
         super().__init__()
         self.manager = manager
         self.url = url
@@ -139,6 +157,11 @@ class DownloadWorker(QRunnable):
         self.start_byte = start_byte
         self.end_byte = end_byte
         self.headers = headers
+        # Whether the server supports byte ranges. When False, this worker does
+        # a plain full-file GET (no Range header) and accepts a 200 -- there's
+        # exactly one worker covering the whole file in that case. When True,
+        # ranged requests are strictly validated as 206 + Content-Range.
+        self.ranges_supported = ranges_supported
         self.speed_limiter = speed_limiter
         self.signals = WorkerSignals()
         self.is_stopped = False
@@ -153,6 +176,35 @@ class DownloadWorker(QRunnable):
 
     def _is_stale(self) -> bool:
         return self.is_stopped or self.manager.worker_epoch != self.epoch
+
+    def _verify_partial_response(self, response, requested_start: int):
+        """Assert the server actually honoured our Range request.
+
+        A ranged GET must answer 206 Partial Content with a Content-Range whose
+        start matches what we asked for. A 200 (whole file) written at our chunk
+        offset would corrupt the output, so we reject it. A missing or
+        mismatched Content-Range is treated the same way -- we only proceed when
+        the server has demonstrably given us the slice we asked for.
+
+        Raises RangeNotHonoredError (a RequestException subclass) so the normal
+        worker error path handles it; the manager then fails the download
+        rather than writing corrupt bytes.
+        """
+        if response.status_code != 206:
+            raise RangeNotHonoredError(
+                f"expected HTTP 206 for range request, got {response.status_code} "
+                f"(server ignored the Range header and may be sending the whole file)")
+        content_range = response.headers.get('Content-Range', '')
+        # Expected form: "bytes START-END/TOTAL"
+        m = re.match(r'bytes\s+(\d+)-(\d+)/(\d+|\*)', content_range.strip(), re.IGNORECASE)
+        if not m:
+            raise RangeNotHonoredError(
+                f"206 response had a missing/unparseable Content-Range: {content_range!r}")
+        resp_start = int(m.group(1))
+        if resp_start != requested_start:
+            raise RangeNotHonoredError(
+                f"server returned the wrong slice: asked for byte {requested_start}, "
+                f"got Content-Range starting at {resp_start}")
 
     @staticmethod
     def _build_default_session():
@@ -182,8 +234,9 @@ class DownloadWorker(QRunnable):
         )
 
         try:
-            req_headers = {'Range': f'bytes={current_pos}-{self.end_byte}'}
-            req_headers.update(self.headers)
+            req_headers = dict(self.headers)
+            if self.ranges_supported:
+                req_headers['Range'] = f'bytes={current_pos}-{self.end_byte}'
             with session.get(self.url, headers=req_headers, stream=True, timeout=30, verify=self.verify_tls) as r:
                 logger.debug(
                     "[%s] Response for chunk %d-%d: HTTP %d, Content-Length=%s, Content-Range=%s",
@@ -191,6 +244,24 @@ class DownloadWorker(QRunnable):
                     r.headers.get('Content-Length'), r.headers.get('Content-Range'),
                 )
                 r.raise_for_status()
+                if self.ranges_supported:
+                    # SECURITY/CORRECTNESS: we sent a Range request, so the ONLY
+                    # acceptable answer is 206 Partial Content with a matching
+                    # Content-Range. A 200 means the server ignored the range and
+                    # is sending the *whole file* -- writing that at current_pos
+                    # would corrupt the output while our < completion check would
+                    # still call it done. Reject anything that isn't a verified
+                    # partial response.
+                    self._verify_partial_response(r, current_pos)
+                elif current_pos != 0:
+                    # No range support but we're resuming mid-file: we can't ask
+                    # for just the tail, so a plain GET would restart from 0 and
+                    # double-write. Restart this (single) chunk cleanly instead.
+                    current_pos = 0
+                    self.manager.chunk_progress[self.start_byte] = 0
+                # Hard cap: never consume more than the range we asked for,
+                # even if the server streams extra. Overshoot = corruption.
+                remaining = self.end_byte - current_pos + 1
                 bytes_this_run = 0
                 with open(self.file_path, "r+b") as f:
                     f.seek(current_pos)
@@ -210,20 +281,37 @@ class DownloadWorker(QRunnable):
                             return
 
                         if chunk:
+                            if len(chunk) > remaining:
+                                # Server sent more than the requested range.
+                                # Truncate to the range and stop -- writing the
+                                # overflow would push past this chunk's slot.
+                                chunk = chunk[:remaining]
+                            if not chunk:
+                                logger.warning(
+                                    "[%s] Chunk %d-%d: server sent more than the requested "
+                                    "range; truncating at boundary.", did, self.start_byte, self.end_byte)
+                                break
                             if self.speed_limiter is not None:
                                 self.speed_limiter.acquire(len(chunk))
                             f.write(chunk)
                             bytes_this_run += len(chunk)
+                            remaining -= len(chunk)
                             self.signals.chunk_downloaded.emit(len(chunk))
                             self.manager.chunk_progress[self.start_byte] = (
                                 self.manager.chunk_progress.get(self.start_byte, 0) + len(chunk)
                             )
+                            if remaining <= 0:
+                                break
             expected = self.end_byte - self.start_byte + 1
             actual = self.manager.chunk_progress.get(self.start_byte, 0)
-            if actual < expected:
+            if actual != expected:
+                # Not exactly the expected bytes -- short (early close / ignored
+                # range) or, after the cap above, at most equal. Never silently
+                # accept a mismatch: surface it so the manager treats the
+                # download as incomplete rather than falsely "completed".
                 logger.warning(
-                    "[%s] Worker for chunk %d-%d finished but only wrote %d/%d expected bytes "
-                    "(server may have closed the connection early or ignored the Range header)",
+                    "[%s] Worker for chunk %d-%d wrote %d bytes, expected exactly %d "
+                    "(server closed early or misbehaved on the range).",
                     did, self.start_byte, self.end_byte, actual, expected,
                 )
             else:
@@ -399,6 +487,9 @@ class DownloadManager(QObject):
             return
         if accept_ranges != 'bytes':
             self.num_threads = 1
+            self.ranges_supported = False
+        else:
+            self.ranges_supported = True
 
         if not (os.path.exists(self.save_path) and self.load_progress()):
             self.downloaded_size = 0
@@ -465,7 +556,8 @@ class DownloadManager(QObject):
     def _start_worker(self, start, end):
         worker = DownloadWorker(self, self.url, self.save_path, start, end, self.headers,
                                  speed_limiter=self.speed_limiter, epoch=self.worker_epoch,
-                                 verify_tls=self.verify_tls)
+                                 verify_tls=self.verify_tls,
+                                 ranges_supported=getattr(self, 'ranges_supported', True))
         worker.signals.chunk_downloaded.connect(self.on_chunk_downloaded)
         worker.signals.finished.connect(self.on_worker_finished)
         worker.signals.error.connect(self.on_worker_error)
@@ -504,13 +596,29 @@ class DownloadManager(QObject):
 
     def finish_download(self):
         self.save_progress()
-        if self.downloaded_size < self.total_size:
+        if self.downloaded_size != self.total_size:
             logger.warning(
                 f"[{self.download_id}] All workers finished but downloaded_size "
-                f"({self.downloaded_size}) < total_size ({self.total_size}) -- treating as an error. "
+                f"({self.downloaded_size}) != total_size ({self.total_size}) -- treating as an error. "
                 f"chunk_progress={self.chunk_progress}"
             )
-            self.on_worker_error((RuntimeError, RuntimeError("Download finished with incomplete data."), None))
+            self.on_worker_error((RuntimeError, RuntimeError(
+                "Download finished with a byte count that doesn't match the expected size."), None))
+            return
+
+        # Belt-and-suspenders: the bytes we *think* we wrote must match what's
+        # actually on disk. Catches a truncated/overwritten file that the
+        # in-memory counters wouldn't reflect.
+        try:
+            on_disk = os.path.getsize(self.save_path)
+        except OSError as e:
+            self.on_worker_error((OSError, e, None))
+            return
+        if on_disk != self.total_size:
+            logger.error(
+                f"[{self.download_id}] On-disk size {on_disk} != expected {self.total_size}.")
+            self.on_worker_error((RuntimeError, RuntimeError(
+                f"Downloaded file is {on_disk} bytes, expected {self.total_size}."), None))
             return
 
         logger.info(f"[{self.download_id}] All chunks complete ({self.downloaded_size} bytes).")
@@ -619,7 +727,32 @@ class DownloadManager(QObject):
         self.workers.clear()
         self.active_workers = 0
 
+    def prepare_retry(self):
+        """Reset a finished/failed download to PENDING so the queue can start
+        it under the normal concurrency limit. Unlike the old retry(), this
+        does NOT call start() itself -- process_queue owns starting downloads
+        and the active-count accounting, so there's exactly one path and the
+        concurrency limit is always honoured. Handles COMPLETED too (a
+        re-download), which the old retry() silently ignored.
+        """
+        logger.info(f"Preparing retry for download {self.download_id} (was {self.status.name})")
+        self.workers.clear()
+        self.active_workers = 0
+        self.traceback_info = ""
+        # Bump the epoch so any stragglers from the previous run retire.
+        self.worker_epoch += 1
+        if self.status in (Status.STOPPED, Status.COMPLETED):
+            # Start clean: STOPPED discarded partial state; COMPLETED is a
+            # deliberate re-download. ERROR keeps its .progress so it can
+            # resume from where it failed.
+            self.downloaded_size = 0
+            self.chunk_progress = {}
+        self.set_status(Status.PENDING)
+
     def retry(self):
+        # Retained for API/back-compat: reset and start immediately. The GUI
+        # now routes through prepare_retry() + process_queue() instead so the
+        # concurrency limit is respected.
         if self.status in [Status.ERROR, Status.STOPPED]:
             logger.info(f"Retrying download {self.download_id}")
             self.workers.clear()

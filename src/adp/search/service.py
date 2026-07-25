@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """SearchService: the one implementation of "search for torrents", called by
 the Search tab, the REST API, and the MCP tools alike -- same principle as
 AppController for downloads: exactly one answer to what a search means.
@@ -7,6 +9,7 @@ provider is reported in SearchOutcome.errors but never fails the search.
 Results are deduplicated by infohash (seeders merged with max(), not sum --
 two indexers reporting the same swarm are one swarm) and ranked.
 """
+
 from __future__ import annotations
 
 import logging
@@ -14,6 +17,7 @@ import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import timezone
 from typing import Callable, Dict, List, Optional
 
 import requests
@@ -155,7 +159,13 @@ def score(result: SearchResult) -> float:
     the same infohash reported by multiple providers -- earns a bonus."""
     value = math.log1p(max(result.seeders, 0)) * 10.0
     if result.published is not None:
-        age_days = max((utcnow() - result.published).total_seconds() / 86400.0, 0.0)
+        published = result.published
+        # Defend against a naive datetime arriving from any source (a
+        # provider we don't control, a directly-constructed result): mixing
+        # naive and aware datetimes raises TypeError. Assume UTC if naive.
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        age_days = max((utcnow() - published).total_seconds() / 86400.0, 0.0)
         value += 5.0 * math.pow(0.5, age_days / _RECENCY_HALF_LIFE_DAYS)
     if result.size_bytes is not None and result.size_bytes < 16 * 1024:
         value -= 20.0

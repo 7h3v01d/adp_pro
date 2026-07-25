@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Centralized logging configuration for Accelerated Downloader Pro.
 
 Goal: when a download fails, there should be a plain-text log file a user
@@ -9,6 +11,7 @@ attached.
 configure_logging() should be called exactly once, as early as possible
 (before any DownloadManager is created), typically from main.py.
 """
+
 from __future__ import annotations
 
 import logging

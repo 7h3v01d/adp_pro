@@ -1,4 +1,4 @@
-# ADP Pro
+# Accelerated Downloader Pro
 
 A multi-threaded, resumable download manager with a PyQt6 "Pro" GUI:
 categories, search/filter, per-download speed limits, scheduling,
@@ -10,10 +10,16 @@ headless-testable core engine.
 
 **Core download engine**
 - Concurrent, chunked downloads (configurable connection count per file)
-- Resume after a crash or restart (progress is persisted to a `.progress`
-  sidecar file and verified against the server's ETag before trusting it)
+- Resume after a crash or restart: active *and* paused downloads are persisted
+  and picked back up (progress is stored in a `.progress` sidecar and verified
+  against the server's ETag before being trusted)
 - SHA-256 checksum verification
 - Automatic single-thread fallback when a server doesn't support byte ranges
+- Range integrity: ranged responses are strictly validated (206 + matching
+  Content-Range, bytes capped to the requested range, exact-size and on-disk
+  checks at completion) so a server that ignores or mishandles Range headers
+  fails the download instead of silently writing corrupt data; transfer
+  compression is disabled on downloads so byte offsets always mean raw bytes
 - Fail-safe recovery if resume state is ever corrupt/inconsistent
 - Per-download and default bandwidth throttling (token-bucket limiter)
 
@@ -136,19 +142,22 @@ etc.) are written on first run.
 **Any platform (manual):**
 
 ```bash
-pip install -r requirements.txt
-pip install -e .        # editable install: puts src/ on the path
+pip install -e .              # core: Downloads + REST/MCP (no torrents)
+pip install -e ".[torrents]"  # add torrent support (needs a libtorrent wheel)
 ```
 
 The project uses a `src/` layout, so `adp` is only importable after that
 editable install (or with `src/` on `PYTHONPATH`). This is deliberate -- it
 means tests and `python -m adp.main` run against the same package that ships.
 
-**Torrent support is optional.** The app depends on `libtorrent`, a native
-C-extension with platform/Python-version-specific wheels. If it fails to
-install or import, the app still launches fine with a fully working
-Downloads tab -- the Torrents tab just shows a message explaining how to
-enable it, instead of the app crashing on startup.
+**Torrent support is optional** and lives in the `[torrents]` extra, because
+`libtorrent` is a native C-extension with platform/Python-version-specific
+wheels. The core install deliberately omits it: a plain `pip install -e .`
+always succeeds and gives you a fully working Downloads tab (plus REST/MCP).
+If `libtorrent` isn't installed or can't be imported, the app still launches
+fine -- the Torrents tab just shows a message explaining how to enable it,
+instead of the app crashing on startup. (`setup.bat` and the `[dev]` extra
+include libtorrent so the full test suite runs.)
 
 If `pip install libtorrent` doesn't work for your platform:
 - Confirm your Python version has a wheel on

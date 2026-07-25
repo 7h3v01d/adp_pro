@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Generates and persists a local API key used to authenticate requests to
 the REST/MCP API. The API always binds to 127.0.0.1 only, but a full-control
 API (add/pause/remove downloads and torrents) reachable by *any* local
@@ -5,6 +7,7 @@ process or, worse, a malicious web page via a browser fetch to localhost,
 is a real risk without this -- the key is what turns "any process on this
 machine" into "only whoever has this key".
 """
+
 from __future__ import annotations
 
 import logging

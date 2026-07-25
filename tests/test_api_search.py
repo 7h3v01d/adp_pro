@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """REST /search routes and controller search wiring.
 
 Search deliberately bypasses GuiBridge (it never touches Qt objects), so

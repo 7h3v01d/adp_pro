@@ -1,4 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Shared data types used across the core download engine."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

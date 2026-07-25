@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Storage locations and free-disk-space checks.
 
 Motivated by a real incident: torrents defaulted to a folder under the
@@ -11,6 +13,7 @@ applied here:
    full, not when the write fails -- and it should always leave headroom,
    because a 100%-full system drive breaks far more than the download.
 """
+
 from __future__ import annotations
 
 import os
@@ -26,20 +29,35 @@ from adp.utils.format import format_size
 DEFAULT_HEADROOM_BYTES = 512 * 1024 * 1024  # 512 MiB
 
 
+class ConfiguredPathUnavailableError(OSError):
+    """Raised when a path the user explicitly configured can't be used. We
+    deliberately do NOT fall back to the default in this case -- silently
+    redirecting a download to the system drive is exactly the incident the
+    storage config exists to prevent (configure E:\\Downloads, unplug the
+    drive, and a silent fallback fills C:)."""
+
+    def __init__(self, configured: str, reason: str):
+        super().__init__(f"Configured location '{configured}' is unavailable: {reason}")
+        self.configured = configured
+
+
 def resolve_dir(configured: Optional[str], fallback: str) -> str:
-    """The directory to actually use: the user-configured one when set (with
-    ~ expanded), else the fallback. Creates it if possible; if the configured
-    location can't be created (drive unplugged, permissions), falls back
-    rather than failing -- with the reasoning that a download landing in the
-    default folder beats a download that can't start at all."""
+    """The directory to actually use.
+
+    If the user *explicitly configured* a location, it must be usable -- if it
+    isn't (drive unplugged, permission denied), we raise
+    ConfiguredPathUnavailableError rather than silently falling back, so the
+    user is told and can choose deliberately. Fallback to the default folder
+    happens ONLY when no location was configured at all.
+    """
     candidate = (configured or "").strip()
     if candidate:
         candidate = os.path.expanduser(candidate)
         try:
             os.makedirs(candidate, exist_ok=True)
             return candidate
-        except OSError:
-            pass
+        except OSError as e:
+            raise ConfiguredPathUnavailableError(candidate, str(e)) from e
     os.makedirs(fallback, exist_ok=True)
     return fallback
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """JSON + binary-blob persistence for the torrent queue.
 
 Two things need to survive a restart:
@@ -8,6 +10,7 @@ Two things need to survive a restart:
    peer cache -- which is what actually makes a restart resume quickly
    instead of doing a full recheck.
 """
+
 from __future__ import annotations
 
 import json

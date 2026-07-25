@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Pure formatting helpers, deliberately kept free of any GUI or Qt imports
 so they're trivial to unit test."""
+
 
 _POWER_LABELS = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
 

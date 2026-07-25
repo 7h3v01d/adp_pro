@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Lightweight download scheduler.
 
 A QTimer ticks on an interval and asks the scheduler to check whether any
@@ -6,6 +8,7 @@ removed from the schedule and a callback is invoked to actually start it.
 This is intentionally decoupled from Qt's timer so the due-check logic itself
 is trivially unit-testable with an injected clock.
 """
+
 from __future__ import annotations
 
 from datetime import datetime

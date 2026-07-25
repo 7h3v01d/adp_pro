@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """The single business-logic layer sitting between the API surfaces (REST,
 MCP) and the actual GUI panels. Both servers call the SAME methods here, so
 there's exactly one implementation of "what does add_download mean" no
@@ -12,6 +14,7 @@ Return values are always plain, JSON-serializable Python data (dicts,
 lists, strings, numbers) -- never raw Qt objects, DownloadManager
 instances, or torrent handles -- since these cross into REST/MCP responses.
 """
+
 from __future__ import annotations
 
 import base64
@@ -27,6 +30,12 @@ from adp.core.models import Status
 from adp.utils.format import format_size, format_speed
 
 logger = logging.getLogger(__name__)
+
+# A .torrent is a small metadata file; anything large is either a mistake or
+# an attempt to exhaust memory/disk across the API boundary. 10 MiB is far
+# above any legitimate .torrent (even huge multi-file torrents are well under
+# 1 MiB of metadata).
+MAX_TORRENT_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 class ApiError(Exception):
@@ -127,9 +136,14 @@ class AppController:
     def _retry_download_impl(self, download_id: str) -> dict:
         manager = self._require_download(download_id)
         if manager.status in (Status.ERROR, Status.STOPPED, Status.COMPLETED):
-            self.download_panel.download_queue.append(manager)
+            # Same single-path retry the GUI uses: reset to PENDING and let
+            # process_queue start it under the concurrency limit, rather than
+            # starting it directly (which ran outside the limit and dropped
+            # the un-decremented manager from the queue).
+            manager.prepare_retry()
+            if manager not in self.download_panel.download_queue:
+                self.download_panel.download_queue.append(manager)
             self.download_panel.process_queue()
-            manager.retry()
         return self._serialize_download(manager)
 
     def remove_download(self, download_id: str) -> dict:
@@ -206,6 +220,8 @@ class AppController:
         self._require_torrent_support()
         if not magnet_uri and not torrent_file_base64:
             raise ApiError("Provide either magnet_uri or torrent_file_base64.")
+        if magnet_uri and torrent_file_base64:
+            raise ApiError("Provide exactly one of magnet_uri or torrent_file_base64, not both.")
         return self.bridge.call(
             self._add_torrent_impl, magnet_uri, torrent_file_base64, torrent_file_name,
             save_path, category, seed_ratio_limit,
@@ -217,17 +233,31 @@ class AppController:
 
         if torrent_file_base64:
             try:
-                raw = base64.b64decode(torrent_file_base64)
+                raw = base64.b64decode(torrent_file_base64, validate=True)
             except Exception as e:
                 raise ApiError(f"torrent_file_base64 isn't valid base64: {e}")
-            tmp_dir = tempfile.mkdtemp(prefix="adp-api-torrent-")
-            tmp_path = os.path.join(tmp_dir, torrent_file_name or "upload.torrent")
-            with open(tmp_path, "wb") as f:
-                f.write(raw)
-            torrent_id = self.torrent_panel.add_torrent(
-                mode="file", torrent_file_path=tmp_path, save_path=save_path,
-                category=category, seed_ratio_limit=seed_ratio_limit,
-            )
+            if not raw:
+                raise ApiError("torrent_file_base64 decoded to empty data.")
+            if len(raw) > MAX_TORRENT_UPLOAD_BYTES:
+                raise ApiError(
+                    f"torrent file too large ({len(raw)} bytes; "
+                    f"max {MAX_TORRENT_UPLOAD_BYTES}).")
+            # SECURITY: never build the temp path from the caller-supplied
+            # name. os.path.join(tmp, name) lets `../../x` escape the temp dir
+            # and, on Windows, an absolute `C:\...` name override it entirely
+            # -- turning "add a torrent" into an arbitrary file-write primitive
+            # across the MCP/REST trust boundary. The on-disk name is always a
+            # fixed constant; torrent_file_name is metadata only, and libtorrent
+            # reads the real name from the torrent's own info dict regardless.
+            # TemporaryDirectory guarantees cleanup even on error.
+            with tempfile.TemporaryDirectory(prefix="adp-api-torrent-") as tmp_dir:
+                tmp_path = os.path.join(tmp_dir, "upload.torrent")
+                with open(tmp_path, "wb") as f:
+                    f.write(raw)
+                torrent_id = self.torrent_panel.add_torrent(
+                    mode="file", torrent_file_path=tmp_path, save_path=save_path,
+                    category=category, seed_ratio_limit=seed_ratio_limit,
+                )
         else:
             torrent_id = self.torrent_panel.add_torrent(
                 mode="magnet", magnet_uri=magnet_uri, save_path=save_path,

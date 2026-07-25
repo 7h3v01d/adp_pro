@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Data types for the torrent engine -- kept separate from the HTTP
 downloader's models.py since torrents have a materially different lifecycle
 (metadata resolution, seeding, ratio, per-file selection) even though both
 eventually show up as "things in a queue" in the GUI.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

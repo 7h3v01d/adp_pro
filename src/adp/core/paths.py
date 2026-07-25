@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Resolves an OS-appropriate, per-user directory for the app's persistent
 data: session queue, settings, and logs. Centralized here so all three
 always live next to each other, which matters a lot when someone's trying
 to find the log file to diagnose a problem.
 """
+
 from __future__ import annotations
 
 import os

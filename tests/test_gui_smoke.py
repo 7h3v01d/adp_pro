@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 import os
 import time
 
@@ -190,3 +192,60 @@ def test_settings_dialog_round_trips_values(qtbot):
     settings = dialog.get_settings()
     assert settings["theme"] == "dark"
     assert settings["minimize_to_tray"] is False
+
+
+def test_retry_completed_download_reruns_via_queue(qtbot, panel, mock_server, download_dir):
+    """Retrying a COMPLETED download must actually re-run it (re-fetch from the
+    server) and keep active-download accounting correct. The old path no-op'd
+    on COMPLETED -- retry() only handled ERROR/STOPPED -- so nothing happened."""
+    import time
+    from adp.core.models import Status
+    mock_server.add_file("retry_me.bin", b"z" * 4000)
+    save = os.path.join(download_dir, "retry_me.bin")
+    manager, _ = panel.add_download(mock_server.url_for("retry_me.bin"), save)
+
+    deadline = time.time() + 15
+    while time.time() < deadline and manager.status != Status.COMPLETED:
+        qtbot.wait(20)
+    assert manager.status == Status.COMPLETED
+    assert panel.active_downloads == 0
+    requests_before = mock_server.request_count("retry_me.bin")
+    assert requests_before > 0
+
+    # Select it and retry -- must trigger a fresh fetch.
+    panel.download_list.setCurrentRow(0)
+    panel.retry_selected_download()
+
+    deadline = time.time() + 15
+    while time.time() < deadline and (
+        manager.status != Status.COMPLETED
+        or mock_server.request_count("retry_me.bin") <= requests_before
+    ):
+        qtbot.wait(20)
+    assert manager.status == Status.COMPLETED
+    # The re-download actually hit the server again -- proof it re-ran.
+    assert mock_server.request_count("retry_me.bin") > requests_before
+    # Accounting settled again -- never left over-counted.
+    assert panel.active_downloads == 0
+
+
+def test_retry_respects_concurrency_accounting(qtbot, panel, mock_server, download_dir):
+    """After a retry cycle, active_downloads must return to 0 -- proving the
+    retried download was counted and decremented through the normal path
+    rather than started off-book."""
+    import time
+    from adp.core.models import Status
+    mock_server.add_file("acct.bin", b"q" * 3000)
+    save = os.path.join(download_dir, "acct.bin")
+    manager, _ = panel.add_download(mock_server.url_for("acct.bin"), save)
+    deadline = time.time() + 15
+    while time.time() < deadline and manager.status != Status.COMPLETED:
+        qtbot.wait(20)
+
+    panel.download_list.setCurrentRow(0)
+    panel.retry_selected_download()
+    deadline = time.time() + 15
+    while time.time() < deadline and manager.status != Status.COMPLETED:
+        qtbot.wait(20)
+    assert manager.status == Status.COMPLETED
+    assert panel.active_downloads == 0

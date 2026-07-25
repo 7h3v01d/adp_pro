@@ -1,11 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Small JSON-backed store for app-wide (non-download) preferences."""
+
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 
 logger = logging.getLogger(__name__)
+
+
+def _deep_merge(base: dict, overlay: dict) -> None:
+    """Recursively merge overlay into base in place. Nested dicts are merged
+    key-by-key (so a stored partial search_providers block keeps the defaults
+    for providers it doesn't mention) rather than wholesale-replaced."""
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
 
 DEFAULT_SETTINGS = {
     "theme": "dark",   # dark-industrial is the house default
@@ -45,13 +60,18 @@ class AppSettingsStore:
         self.settings_file = settings_file
 
     def load(self) -> dict:
-        settings = dict(DEFAULT_SETTINGS)
+        # Deep copy: DEFAULT_SETTINGS has nested dicts (search_providers), and
+        # a shallow dict() copy would share those nested objects with the
+        # module-level default -- later mutations would corrupt it process-wide.
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
         if os.path.exists(self.settings_file):
             try:
                 with open(self.settings_file, 'r') as f:
-                    settings.update(json.load(f))
+                    stored = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
                 logger.error(f"Failed to load settings, using defaults: {e}")
+                stored = {}
+            _deep_merge(settings, stored)
         return settings
 
     def save(self, settings: dict) -> None:

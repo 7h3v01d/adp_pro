@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """GUI-independent torrent engine, wrapping a single libtorrent session.
 
 Mirrors the shape of core/downloader.py (Qt signals for progress/finish/
@@ -10,6 +12,7 @@ libtorrent's own alert queue is the source of truth; we poll it on a timer
 rather than blocking on it, since it needs to interleave with the Qt event
 loop.
 """
+
 from __future__ import annotations
 
 import logging

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Theme system contracts: default resolution, palette completeness, and
 that the QSS templates render without leftover placeholders."""
 from adp.gui.theme import DARK, DARK_QSS, LIGHT, LIGHT_QSS, STATUS, stylesheet_for

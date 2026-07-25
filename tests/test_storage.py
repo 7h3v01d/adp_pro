@@ -1,8 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Storage-location and disk-space-guard tests."""
 import os
 
+import pytest
+
 from adp.core.storage import (
-    DEFAULT_HEADROOM_BYTES, check_space, free_space_bytes, resolve_dir,
+    DEFAULT_HEADROOM_BYTES, ConfiguredPathUnavailableError, check_space,
+    free_space_bytes, resolve_dir,
 )
 
 
@@ -30,12 +35,17 @@ class TestResolveDir:
         assert os.path.normpath(result) == os.path.normpath(
             os.path.join(str(tmp_path), "adp_downloads"))
 
-    def test_falls_back_when_configured_uncreatable(self, tmp_path):
-        # A path whose parent is a file can't be made into a directory.
+    def test_raises_when_configured_uncreatable(self, tmp_path):
+        # An explicitly-configured path that can't be created must fail
+        # closed -- silently redirecting to the default is the exact incident
+        # (fill the system drive) the config exists to prevent.
         blocker = tmp_path / "not_a_dir"
-        blocker.write_text("x")
+        blocker.write_text("x")  # a file where a dir parent is needed
         fallback = str(tmp_path / "fallback")
-        assert resolve_dir(str(blocker / "sub"), fallback) == fallback
+        with pytest.raises(ConfiguredPathUnavailableError):
+            resolve_dir(str(blocker / "sub"), fallback)
+        # And it must NOT have created/used the fallback.
+        assert not os.path.exists(fallback)
 
 
 class TestFreeSpace:

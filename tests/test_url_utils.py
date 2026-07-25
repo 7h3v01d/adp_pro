@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 import pytest
 
 from adp.utils.url_utils import is_probably_url, looks_like_download_url, extract_urls_from_mime_text

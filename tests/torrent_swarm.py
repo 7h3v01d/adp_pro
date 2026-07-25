@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """A minimal local BitTorrent 'swarm' for offline testing: one seed session
 holding real data, bound to loopback with tracker/DHT/LSD disabled, so
 tests connect a leeching TorrentEngine directly to it (bypassing any real

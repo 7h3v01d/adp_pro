@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """JSON-backed persistence for the download queue/list across app restarts.
 
 Kept free of any Qt widget dependency so it can be unit tested by simply
 reading/writing DownloadRecord objects.
 """
+
 from __future__ import annotations
 
 import json

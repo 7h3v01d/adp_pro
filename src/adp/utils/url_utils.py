@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Pure, GUI-independent helpers for recognizing downloadable-looking URLs
 (used by clipboard monitoring and drag-and-drop handling) and for deriving
 safe local filenames from server responses."""
+
 from __future__ import annotations
 
 import os

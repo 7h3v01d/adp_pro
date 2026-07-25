@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Dev-only tool: a browser shell with the real DownloadPanel docked beside
 it, so you can click download links on real sites and watch them land in
 Accelerated Downloader Pro. Not part of the pytest suite or the shipped app;
@@ -7,6 +9,7 @@ Requires PyQt6-WebEngine, which isn't a runtime dependency of the app itself
 -- install it separately if you want to use this tool:
     pip install PyQt6-WebEngine
 """
+
 import sys
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QDockWidget, QFileDialog

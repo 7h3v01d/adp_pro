@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Search providers: one adapter per upstream indexer source.
 
 Deliberately synchronous and built on `requests` -- the same HTTP stack the
@@ -11,6 +13,7 @@ Providers must raise ProviderError (never raw requests exceptions) so the
 service can attribute failures and degrade gracefully: one dead provider
 never fails the whole search. Malformed rows cost the row, not the search.
 """
+
 from __future__ import annotations
 
 import abc
@@ -212,6 +215,14 @@ def _parse_iso_date(value: Any) -> Optional[datetime]:
     if not value or not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # Many indexers (Jackett among them) emit timestamps with no timezone.
+    # The ranker compares published dates against an aware utcnow(), and
+    # subtracting a naive from an aware datetime raises TypeError -- which,
+    # happening after provider fan-out, would take down the whole search.
+    # Normalise everything to aware UTC so ranking is always safe.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed

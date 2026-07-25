@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """A minimal, dependency-free HTTP server that supports Range requests,
 used so the pytest suite can exercise real socket I/O without touching
 the network. Runs in a background thread per test.
@@ -99,6 +101,10 @@ class RangeRequestHandler(http.server.BaseHTTPRequestHandler):
 
         self.send_response(status)
         self.send_header('Content-Length', str(len(chunk)))
+        if status == 206:
+            # A real server returns Content-Range with every 206. The engine
+            # now validates this, so the mock must behave correctly too.
+            self.send_header('Content-Range', f'bytes {start}-{end}/{total}')
         if self.accept_ranges:
             self.send_header('Accept-Ranges', 'bytes')
         self.send_header('ETag', f'"{hashlib.md5(body).hexdigest()}"')

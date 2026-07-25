@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 import os
 import sys
 
@@ -22,3 +24,29 @@ def test_default_log_dir_is_nested_under_app_data_dir(tmp_path):
     log_dir = default_log_dir(app_data)
     assert os.path.isdir(log_dir)
     assert log_dir == os.path.join(app_data, "logs")
+
+
+class TestSettingsDeepMerge:
+    """AppSettingsStore.load must deep-copy defaults and deep-merge stored
+    values, so nested config (search_providers) is neither shared with the
+    module default nor clobbered by a partial stored file."""
+
+    def test_partial_stored_provider_keeps_default_siblings(self, tmp_path):
+        import json
+        from adp.core.app_settings import AppSettingsStore, DEFAULT_SETTINGS
+        settings_file = tmp_path / "settings.json"
+        # Stored file only mentions jackett; torrents_csv default must survive.
+        settings_file.write_text(json.dumps({
+            "search_providers": {"jackett": {"enabled": True, "api_key": "K"}}
+        }))
+        loaded = AppSettingsStore(str(settings_file)).load()
+        assert loaded["search_providers"]["jackett"]["api_key"] == "K"
+        assert "torrents_csv" in loaded["search_providers"]
+        # And the module-level default was not mutated.
+        assert DEFAULT_SETTINGS["search_providers"]["jackett"].get("api_key", "") == ""
+
+    def test_load_does_not_share_nested_dicts_with_default(self, tmp_path):
+        from adp.core.app_settings import AppSettingsStore, DEFAULT_SETTINGS
+        loaded = AppSettingsStore(str(tmp_path / "none.json")).load()
+        loaded["search_providers"]["jackett"]["api_key"] = "MUTATED"
+        assert DEFAULT_SETTINGS["search_providers"]["jackett"].get("api_key", "") == ""

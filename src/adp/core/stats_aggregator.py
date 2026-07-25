@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Aggregates byte-transfer stats across both engines (HTTP downloads and
 torrents) into session (this run only) and lifetime (persisted) totals.
 
@@ -9,6 +11,7 @@ handles pause/resume/seeding correctly without needing a discrete
 "completed" event to attribute bytes, and keeps this class Qt-independent
 and easily testable.
 """
+
 from __future__ import annotations
 
 from typing import Dict

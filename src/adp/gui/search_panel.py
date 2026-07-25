@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """The Search tab: query the enabled torrent indexers, browse ranked
 results, and add a result to the Torrents tab in one click.
 
@@ -16,6 +18,7 @@ blocked waiting on it). This panel already lives on the main thread, so it
 calls TorrentPanel.add_torrent() directly, the same path the Torrents tab's
 own Add dialog uses.
 """
+
 from __future__ import annotations
 
 import logging

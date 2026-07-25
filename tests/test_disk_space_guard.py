@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Regression tests for the disk-full incident:
 
 1. Signals carrying byte counts must survive values >2 GiB (the field bug:

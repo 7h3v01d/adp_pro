@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """REST API for Accelerated Downloader Pro.
 
 Security posture (read before changing any of this):
@@ -14,6 +16,7 @@ Security posture (read before changing any of this):
   victim's browser (a classic localhost-API attack) even though it's
   unauthenticated-by-network-position.
 """
+
 from __future__ import annotations
 
 import logging

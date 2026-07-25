@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Search providers (against canned upstream payloads) and SearchService
 fan-out behavior. No real network anywhere -- providers take the session as
 a parameter precisely so tests can hand them a fake."""

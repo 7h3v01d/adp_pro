@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """A thread-safe token-bucket bandwidth limiter.
 
 Each DownloadManager owns one SpeedLimiter instance which is shared by all of
@@ -5,6 +7,7 @@ its DownloadWorker threads, so the limit applies to the download as a whole
 rather than per-connection. A limit of 0 means "unlimited" and acquire()
 becomes a no-op for speed.
 """
+
 from __future__ import annotations
 
 import threading

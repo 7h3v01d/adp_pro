@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 from datetime import datetime, timedelta
 
 from adp.core.scheduler import DownloadScheduler

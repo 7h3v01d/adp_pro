@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Themes for Accelerated Downloader Pro.
 
 Dark-industrial design system (the default), plus a High-Contrast Light
@@ -10,6 +12,7 @@ structural QSS template and differ only in their token set.
 
 Copyright 2026 Leon Priest (7h3v01d). Apache License 2.0.
 """
+
 from __future__ import annotations
 
 # --- Dark-industrial tokens ------------------------------------------------

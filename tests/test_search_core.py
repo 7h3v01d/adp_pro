@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (7h3v01d)
 """Search core: models, dedupe, and ranking."""
 from datetime import timedelta
 
@@ -103,3 +105,32 @@ class TestRanking:
         multi = make_result(infohash=HASH_B,
                             sources=[SourceHit(provider="p1"), SourceHit(provider="p2")])
         assert rank([single, multi])[0] is multi
+
+
+class TestNaiveDateRanking:
+    """A timezone-less published date (common from Jackett) must not crash the
+    ranker. Before the fix, subtracting a naive date from an aware utcnow()
+    raised TypeError *after* provider fan-out -- taking down the whole search,
+    not just the one result."""
+
+    def test_naive_datetime_does_not_crash_score(self):
+        from datetime import datetime
+        naive = datetime(2026, 7, 25, 10, 0, 0)  # no tzinfo
+        assert naive.tzinfo is None
+        result = make_result(published=naive)
+        ranked = rank([result])  # must not raise
+        assert len(ranked) == 1
+        assert isinstance(ranked[0].score, float)
+
+    def test_parser_normalizes_naive_to_utc(self):
+        from adp.search.providers import _parse_iso_date
+        parsed = _parse_iso_date("2026-07-25T10:00:00")  # no offset
+        assert parsed is not None
+        assert parsed.tzinfo is not None  # coerced to aware
+
+    def test_mixed_naive_and_aware_results_rank_together(self):
+        from datetime import datetime
+        naive = make_result(published=datetime(2026, 1, 1, 0, 0, 0))
+        aware = make_result(infohash=HASH_B, published=utcnow() - timedelta(days=2))
+        ranked = rank([naive, aware])  # must not raise
+        assert len(ranked) == 2
