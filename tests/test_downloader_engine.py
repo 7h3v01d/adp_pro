@@ -421,3 +421,51 @@ def test_non_range_restart_restarts_cleanly(qapp, thread_pool, mock_server, down
     assert manager.downloaded_size == len(content)
     with open(manager.save_path, "rb") as f:
         assert f.read() == content
+
+
+@pytest.mark.timeout(30)
+def test_speed_limited_worker_cannot_write_after_pause(qapp, thread_pool, mock_server, download_dir):
+    """Stale-worker post-throttle race: if the speed limiter blocks and the
+    download is paused during that block, the worker must NOT write the chunk
+    it was holding. It re-checks staleness after acquire() returns."""
+    import threading
+    from adp.core.downloader import DownloadManager
+    from adp.core.speed_limiter import SpeedLimiter
+
+    content = os.urandom(1_000_000)
+    mock_server.add_file("throttle.bin", content)
+
+    manager = DownloadManager(
+        download_id="throttle-race", url=mock_server.url_for("throttle.bin"),
+        save_path=os.path.join(download_dir, "throttle.bin"),
+        thread_pool=thread_pool, num_threads=1,
+    )
+
+    # A speed limiter that, the first time it's asked to throttle, pauses the
+    # manager (bumping worker_epoch) *during* the acquire -- exactly the race
+    # window. After that it behaves normally.
+    real_limiter = SpeedLimiter(0)
+    flipped = threading.Event()
+
+    class RacyLimiter:
+        rate = 500_000
+        def acquire(self, n):
+            if not flipped.is_set():
+                flipped.set()
+                # Simulate the user pausing while we're throttling.
+                manager.pause()
+    manager.speed_limiter = RacyLimiter()
+
+    manager.start()
+    # Wait for the pause to have been triggered from inside acquire().
+    assert pump_events(qapp, lambda: flipped.is_set() and manager.status == Status.PAUSED,
+                        timeout=20)
+    # Give any (incorrect) post-pause write a chance to happen.
+    time.sleep(0.3)
+    qapp.processEvents()
+
+    # The worker must have bailed after acquire() without writing its chunk:
+    # the on-disk progress must not have advanced past what was written before
+    # the pause. Since the racy limiter fires on the first chunk, downloaded
+    # size should be 0 (nothing committed before the first throttled write).
+    assert manager.downloaded_size == 0

@@ -386,3 +386,151 @@ def test_restored_paused_download_respects_concurrency(qtbot, tmp_path, mock_ser
     assert restored.status == Status.COMPLETED
     # Accounting settled back to 0 -- it was counted and decremented, not run off-book.
     assert panel2.active_downloads == 0
+
+
+def test_completed_session_restores_completed_without_network(qtbot, tmp_path, thread_pool):
+    """A COMPLETED download must restore as COMPLETED and NOT re-download.
+    Regression: load_downloads resurrected every non-paused record as PENDING,
+    so completed downloads re-ran on restart. Uses no mock server -- if the
+    restored job tried to download, it would fail/hang against a dead URL."""
+    save_path = os.path.join(str(tmp_path), "done.bin")
+    with open(save_path, "wb") as f:
+        f.write(b"x" * 1000)
+
+    panel1 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel1)
+    m, _ = panel1.add_download("http://192.0.2.1/done.bin", save_path,
+                               num_threads=1, start_immediately=False)
+    # Force it terminal as if it had completed.
+    m.total_size = 1000
+    m.downloaded_size = 1000
+    m.set_status(Status.COMPLETED)
+    panel1.save_downloads()
+
+    panel2 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel2)
+    rid = panel2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = panel2.downloads[rid]
+    # Give any errant queue processing a chance to (wrongly) start it.
+    _poll_until(qtbot, lambda: False, timeout_s=1.0)
+    assert restored.status == Status.COMPLETED
+    assert restored not in panel2.download_queue
+    assert panel2.active_downloads == 0
+
+
+def test_stopped_session_stays_stopped(qtbot, tmp_path, thread_pool):
+    """STOPPED means stopped, across restart -- must not restart."""
+    save_path = os.path.join(str(tmp_path), "stopped.bin")
+    panel1 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel1)
+    m, _ = panel1.add_download("http://192.0.2.1/stopped.bin", save_path,
+                               num_threads=1, start_immediately=False)
+    m.set_status(Status.STOPPED)
+    panel1.save_downloads()
+
+    panel2 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel2)
+    rid = panel2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = panel2.downloads[rid]
+    _poll_until(qtbot, lambda: False, timeout_s=1.0)
+    assert restored.status == Status.STOPPED
+    assert restored not in panel2.download_queue
+    assert panel2.active_downloads == 0
+
+
+def test_error_session_stays_error(qtbot, tmp_path, thread_pool):
+    """ERROR stays ERROR across restart until the user explicitly retries."""
+    save_path = os.path.join(str(tmp_path), "err.bin")
+    panel1 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel1)
+    m, _ = panel1.add_download("http://192.0.2.1/err.bin", save_path,
+                               num_threads=1, start_immediately=False)
+    m.set_status(Status.ERROR)
+    panel1.save_downloads()
+
+    panel2 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel2)
+    rid = panel2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = panel2.downloads[rid]
+    _poll_until(qtbot, lambda: False, timeout_s=1.0)
+    assert restored.status == Status.ERROR
+    assert restored not in panel2.download_queue
+    assert panel2.active_downloads == 0
+
+
+def test_retry_respects_path_reservation(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """RC blocker: a terminal download releases its path reservation, so
+    another download can claim it. Retrying the terminal one must then be
+    REFUSED rather than re-creating a two-managers-one-file collision."""
+    mock_server.add_file("shared.bin", b"z" * 1000)
+    save_path = os.path.join(download_dir, "shared.bin")
+
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    # A: added then forced to a terminal (ERROR) state -> releases reservation.
+    a, _ = panel.add_download(mock_server.url_for("shared.bin"), save_path,
+                              num_threads=1, start_immediately=False)
+    a.set_status(Status.ERROR)
+    # B: now claims the same destination (allowed, since A is terminal).
+    b, b_widget = panel.add_download(mock_server.url_for("shared.bin"), save_path,
+                                     num_threads=1, start_immediately=False)
+    assert b is not None  # B accepted because A had released the path
+
+    # Retrying A must be refused -- B now owns the destination.
+    accepted = panel.retry_download(a.download_id)
+    assert accepted is False
+    assert a.status == Status.ERROR  # unchanged; not resurrected
+
+
+def test_retry_allowed_when_no_path_conflict(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """The conflict check must not over-block: retrying a terminal download
+    with no competing job for its path succeeds."""
+    mock_server.add_file("solo.bin", b"q" * 1000)
+    save_path = os.path.join(download_dir, "solo.bin")
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    a, _ = panel.add_download(mock_server.url_for("solo.bin"), save_path,
+                              num_threads=1, start_immediately=False)
+    a.set_status(Status.ERROR)
+    accepted = panel.retry_download(a.download_id)
+    assert accepted is True
+
+
+def test_removing_restored_paused_does_not_free_another_slot(qtbot, tmp_path, mock_server,
+                                                             download_dir, thread_pool):
+    """Slot-ownership invariant: a restored-paused download holds no slot, so
+    removing it must NOT release someone else's. Regression: active_downloads
+    was a bare counter, and remove() decremented it unconditionally -- so
+    removing a slot-less paused job wrongly freed the running job's slot and
+    let the queue over-start."""
+    mock_server.add_file("slotA.bin", os.urandom(2_000_000))
+    mock_server.set_throttle("slotA.bin", 500_000)
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    panel.concurrency_spinbox.setValue(1)  # exactly one slot
+
+    # A: running, owns the only slot.
+    a, _ = panel.add_download(mock_server.url_for("slotA.bin"),
+                              os.path.join(download_dir, "slotA.bin"), num_threads=1)
+    assert _poll_until(qtbot, lambda: a.status == Status.DOWNLOADING and a.downloaded_size > 0)
+    assert panel.active_downloads == 1
+
+    # B: a restored-paused-style job that never acquired a slot.
+    b, _ = panel.add_download(mock_server.url_for("slotA.bin"),
+                              os.path.join(download_dir, "slotB.bin"),
+                              num_threads=1, start_immediately=False)
+    if b in panel.download_queue:
+        panel.download_queue.remove(b)
+    b.set_status(Status.PAUSED)
+    assert panel.active_downloads == 1  # B holds no slot
+
+    # Remove B -- A's slot must be untouched.
+    panel.download_list.setCurrentRow(panel.download_list.count() - 1)
+    # Ensure we've selected B's row.
+    for row in range(panel.download_list.count()):
+        if panel.download_list.item(row).data(Qt.ItemDataRole.UserRole) == b.download_id:
+            panel.download_list.setCurrentRow(row)
+            break
+    panel.remove_selected_download()
+    assert panel.active_downloads == 1  # A still holds its slot, invariant intact
+    assert a.download_id in panel._slot_holders
