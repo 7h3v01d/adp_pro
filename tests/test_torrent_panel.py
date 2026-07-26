@@ -287,3 +287,34 @@ def test_force_recheck_active_torrent_still_verifies(qtbot, torrent_panel, local
 
 def test_force_recheck_unknown_torrent_returns_false(torrent_panel):
     assert torrent_panel.engine.force_recheck("nonexistent-id") is False
+
+
+def test_unavailable_torrent_storage_blocks_add_not_falls_back(qtbot, tmp_path):
+    """Fail-closed torrent storage: when the configured folder is unavailable,
+    the panel must NOT silently redirect to a default -- Add is blocked and the
+    missing path is surfaced. Regression: window.py used to catch the
+    ConfiguredPathUnavailableError and quietly fall back to the system drive."""
+    panel = TorrentPanel(state_dir=str(tmp_path), listen_port=0, enable_dht=False,
+                         unavailable_path="E:\\Torrents")
+    qtbot.addWidget(panel)
+    assert panel.default_save_path is None
+
+    messages = []
+    panel.status_update_requested.connect(lambda msg, *_: messages.append(msg))
+    # Attempting to add with no explicit save_path must be refused, not
+    # redirected to the app-data default.
+    result = panel.add_torrent(mode="magnet", magnet_uri="magnet:?xt=urn:btih:" + "a" * 40)
+    assert result is None
+    assert any("unavailable" in m.lower() and "E:\\Torrents" in m for m in messages)
+
+
+def test_setting_valid_path_recovers_unavailable_storage(qtbot, tmp_path):
+    """Setting a usable default path clears the unavailable state -- how the
+    user recovers after reconnecting a drive / fixing Settings."""
+    panel = TorrentPanel(state_dir=str(tmp_path), listen_port=0, enable_dht=False,
+                         unavailable_path="E:\\Torrents")
+    qtbot.addWidget(panel)
+    recovered = str(tmp_path / "recovered")
+    panel.set_default_save_path(recovered)
+    assert panel._unavailable_path is None
+    assert panel.default_save_path == recovered

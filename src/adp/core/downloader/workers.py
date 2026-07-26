@@ -110,11 +110,12 @@ class DownloadWorker(QRunnable):
     def _verify_partial_response(self, response, requested_start: int):
         """Assert the server actually honoured our Range request.
 
-        A ranged GET must answer 206 Partial Content with a Content-Range whose
-        start matches what we asked for. A 200 (whole file) written at our chunk
-        offset would corrupt the output, so we reject it. A missing or
-        mismatched Content-Range is treated the same way -- we only proceed when
-        the server has demonstrably given us the slice we asked for.
+        A ranged GET must answer 206 Partial Content with a Content-Range that
+        matches what we asked for on ALL fields: start, end, and total. A 200
+        (whole file) written at our chunk offset would corrupt the output, so
+        we reject it; a Content-Range that starts/ends elsewhere or reports a
+        different total means the server violated the representation contract
+        and we can't trust the bytes.
 
         Raises RangeNotHonoredError (a RequestException subclass) so the normal
         worker error path handles it; the manager then fails the download
@@ -125,16 +126,47 @@ class DownloadWorker(QRunnable):
                 f"expected HTTP 206 for range request, got {response.status_code} "
                 f"(server ignored the Range header and may be sending the whole file)")
         content_range = response.headers.get('Content-Range', '')
-        # Expected form: "bytes START-END/TOTAL"
+        # Expected form: "bytes START-END/TOTAL" (TOTAL may be '*' if unknown).
         m = re.match(r'bytes\s+(\d+)-(\d+)/(\d+|\*)', content_range.strip(), re.IGNORECASE)
         if not m:
             raise RangeNotHonoredError(
                 f"206 response had a missing/unparseable Content-Range: {content_range!r}")
         resp_start = int(m.group(1))
+        resp_end = int(m.group(2))
+        resp_total = m.group(3)
         if resp_start != requested_start:
             raise RangeNotHonoredError(
                 f"server returned the wrong slice: asked for byte {requested_start}, "
                 f"got Content-Range starting at {resp_start}")
+        # The end must match what we asked for -- a server sending a wider or
+        # narrower slice than requested has violated the range contract even
+        # if the start is right (the byte cap stops overflow, but the bytes
+        # beyond our request belong to a slice we didn't ask for).
+        if resp_end != self.end_byte:
+            raise RangeNotHonoredError(
+                f"server returned the wrong slice end: asked for {requested_start}-"
+                f"{self.end_byte}, got Content-Range ending at {resp_end}")
+        # The total, when the server states it (not '*'), must match the size
+        # the whole download is based on. A different total means the resource
+        # changed under us and our chunk offsets no longer line up.
+        expected_total = getattr(self.manager, 'total_size', None)
+        if resp_total != '*' and expected_total:
+            if int(resp_total) != expected_total:
+                raise RangeNotHonoredError(
+                    f"server reports a different total size ({resp_total}) than the "
+                    f"download expects ({expected_total}) -- the resource may have changed")
+        # Cross-check Content-Length when present: it must equal the slice span.
+        content_length = response.headers.get('Content-Length')
+        if content_length is not None:
+            try:
+                expected_span = resp_end - resp_start + 1
+                if int(content_length) != expected_span:
+                    raise RangeNotHonoredError(
+                        f"Content-Length {content_length} doesn't match the "
+                        f"Content-Range span {expected_span}")
+            except ValueError:
+                raise RangeNotHonoredError(
+                    f"unparseable Content-Length: {content_length!r}")
 
     @staticmethod
     def _build_default_session():

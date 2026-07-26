@@ -249,3 +249,140 @@ def test_retry_respects_concurrency_accounting(qtbot, panel, mock_server, downlo
         qtbot.wait(20)
     assert manager.status == Status.COMPLETED
     assert panel.active_downloads == 0
+
+
+def test_duplicate_pending_save_path_rejected(qtbot, panel, mock_server, download_dir):
+    """A PENDING download must reserve its destination: a second download to
+    the same path is rejected even though the first hasn't started writing.
+    Regression -- reservation used to only cover active/paused managers, so
+    two pending jobs could both be accepted and collide on start."""
+    mock_server.add_file("pend.bin", os.urandom(1000))
+    save_path = os.path.join(download_dir, "pend.bin")
+    first, _ = panel.add_download(
+        mock_server.url_for("pend.bin"), save_path, num_threads=1, start_immediately=False)
+    assert first is not None
+    assert first.status == Status.PENDING
+
+    second, second_widget = panel.add_download(
+        mock_server.url_for("pend.bin"), save_path, num_threads=1, start_immediately=False)
+    assert second is None and second_widget is None
+    assert panel.download_list.count() == 1
+
+
+def test_duplicate_scheduled_save_path_rejected(qtbot, panel, mock_server, download_dir):
+    """A scheduled (QUEUED) download reserves its path too."""
+    from datetime import datetime, timedelta
+    mock_server.add_file("sched.bin", os.urandom(1000))
+    save_path = os.path.join(download_dir, "sched.bin")
+    future = (datetime.now() + timedelta(hours=1)).isoformat()
+    first, _ = panel.add_download(
+        mock_server.url_for("sched.bin"), save_path, num_threads=1,
+        start_immediately=False, scheduled_time=future)
+    assert first is not None
+
+    second, second_widget = panel.add_download(
+        mock_server.url_for("sched.bin"), save_path, num_threads=1,
+        start_immediately=False, scheduled_time=future)
+    assert second is None and second_widget is None
+    assert panel.download_list.count() == 1
+
+
+def test_duplicate_queued_save_path_rejected(qtbot, panel, mock_server, download_dir):
+    """With the concurrency limit reached, a second same-path job queued
+    behind it is still rejected -- the path is reserved on acceptance."""
+    mock_server.add_file("q.bin", os.urandom(1000))
+    save_path = os.path.join(download_dir, "q.bin")
+    # First job pending (not started); second to same path must be refused
+    # regardless of whether the first has acquired a concurrency slot yet.
+    first, _ = panel.add_download(
+        mock_server.url_for("q.bin"), save_path, num_threads=1, start_immediately=False)
+    assert first is not None
+    second, second_widget = panel.add_download(
+        mock_server.url_for("q.bin"), save_path, num_threads=1, start_immediately=False)
+    assert second is None and second_widget is None
+    assert panel.download_list.count() == 1
+
+
+def _poll_until(qtbot, condition, timeout_s=20.0):
+    """Direct event-pump poll -- more forgiving than qtbot.waitUntil for the
+    multi-stage download/pause/resume flows here."""
+    import time as _t
+    from PyQt6.QtWidgets import QApplication
+    end = _t.time() + timeout_s
+    while _t.time() < end:
+        QApplication.processEvents()
+        if condition():
+            return True
+        _t.sleep(0.02)
+    return False
+
+
+def test_restored_paused_download_can_resume(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """The full GUI/session transition the reviewer flagged: download some
+    bytes, pause, save session, destroy the panel, build a new one, verify the
+    job restores as PAUSED, then resume and verify it COMPLETES with the right
+    bytes. Regression: a restored-paused manager had total_size=0 and never
+    ran start(), so resuming it spawned workers against a 0-byte file instead
+    of fetching metadata and continuing."""
+    content = os.urandom(2_000_000)
+    mock_server.add_file("resume_me.bin", content)
+    mock_server.set_throttle("resume_me.bin", 600_000)
+    save_path = os.path.join(download_dir, "resume_me.bin")
+
+    panel1 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel1)
+    manager, _ = panel1.add_download(
+        mock_server.url_for("resume_me.bin"), save_path, num_threads=2)
+    assert _poll_until(qtbot, lambda: manager.status == Status.DOWNLOADING and manager.downloaded_size > 0)
+    manager.pause()
+    assert _poll_until(qtbot, lambda: manager.status == Status.PAUSED)
+    panel1.save_downloads()
+
+    # New panel from the same state dir -- simulates an app restart.
+    panel2 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel2)
+    restored_id = panel2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = panel2.downloads[restored_id]
+    assert restored.status == Status.PAUSED
+    assert restored.metadata_initialized is False  # never ran start() yet
+
+    # Remove throttle so resume finishes quickly, then resume via the GUI path.
+    mock_server.set_throttle("resume_me.bin", 0)
+    panel2.download_list.setCurrentRow(0)
+    panel2.resume_selected_download()
+
+    assert _poll_until(qtbot, lambda: restored.status.is_terminal)
+    assert restored.status == Status.COMPLETED
+    with open(save_path, "rb") as f:
+        assert f.read() == content
+
+
+def test_restored_paused_download_respects_concurrency(qtbot, tmp_path, mock_server,
+                                                       download_dir, thread_pool):
+    """Resuming a restored-paused download must go through the concurrency
+    accounting (it never held a slot), not bypass the limit."""
+    mock_server.add_file("rc1.bin", os.urandom(1_500_000))
+    mock_server.set_throttle("rc1.bin", 500_000)
+    save_path = os.path.join(download_dir, "rc1.bin")
+
+    panel1 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel1)
+    m, _ = panel1.add_download(mock_server.url_for("rc1.bin"), save_path, num_threads=1)
+    assert _poll_until(qtbot, lambda: m.status == Status.DOWNLOADING and m.downloaded_size > 0)
+    m.pause()
+    assert _poll_until(qtbot, lambda: m.status == Status.PAUSED)
+    panel1.save_downloads()
+
+    panel2 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel2)
+    rid = panel2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = panel2.downloads[rid]
+    assert panel2.active_downloads == 0
+
+    mock_server.set_throttle("rc1.bin", 0)
+    panel2.download_list.setCurrentRow(0)
+    panel2.resume_selected_download()
+    assert _poll_until(qtbot, lambda: restored.status.is_terminal)
+    assert restored.status == Status.COMPLETED
+    # Accounting settled back to 0 -- it was counted and decremented, not run off-book.
+    assert panel2.active_downloads == 0

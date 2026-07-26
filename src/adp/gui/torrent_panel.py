@@ -31,18 +31,29 @@ class TorrentPanel(QWidget):
     torrent_completed = pyqtSignal(str, str)  # torrent_id, name -- for tray notifications
 
     def __init__(self, parent=None, state_dir=None, listen_port=6881, enable_dht=True,
-                 default_seed_ratio_limit=0.0, default_save_path=None):
+                 default_seed_ratio_limit=0.0, default_save_path=None,
+                 unavailable_path=None):
         super().__init__(parent)
         state_dir = state_dir or os.getcwd()
         self.state_dir = state_dir
         self.default_seed_ratio_limit = default_seed_ratio_limit
         self.session_store = TorrentSessionStore(state_dir)
+        # Fail-closed storage: if the user configured a torrent folder that is
+        # currently unavailable (e.g. an unplugged drive), we do NOT silently
+        # redirect downloads to the system drive. Instead the tab opens in a
+        # "storage unavailable" state -- Add is blocked and the UI names the
+        # missing path -- so the user's storage decision is preserved. They fix
+        # it in Settings (or reconnect the drive) and it recovers.
+        self._unavailable_path = unavailable_path
         # Where torrents land by default: caller-provided (the user's
         # configured torrent_download_dir) when given, else the historical
         # app-data location. Settable at runtime via set_default_save_path
         # so a Settings change applies without a restart.
-        self.default_save_path = default_save_path or os.path.join(state_dir, "torrent_downloads")
-        os.makedirs(self.default_save_path, exist_ok=True)
+        if unavailable_path:
+            self.default_save_path = None
+        else:
+            self.default_save_path = default_save_path or os.path.join(state_dir, "torrent_downloads")
+            os.makedirs(self.default_save_path, exist_ok=True)
 
         self.engine = TorrentEngine(listen_port=listen_port, enable_dht=enable_dht)
         self.records = {}  # torrent_id -> TorrentRecord
@@ -142,6 +153,11 @@ class TorrentPanel(QWidget):
     def add_torrent(self, mode, torrent_file_path=None, magnet_uri=None, save_path=None,
                      category="Torrents", file_priorities=None, download_limit_bps=0,
                      upload_limit_bps=0, seed_ratio_limit=0.0):
+        if self._unavailable_path is not None and not save_path:
+            self.status_update_requested.emit(
+                f"Torrent download folder '{self._unavailable_path}' is unavailable. "
+                "Reconnect it or choose another location in Settings.", 8000)
+            return None
         save_path = save_path or self.default_save_path
         os.makedirs(save_path, exist_ok=True)
 
@@ -227,9 +243,12 @@ class TorrentPanel(QWidget):
 
     def set_default_save_path(self, path: str):
         """Applies a new default location for future torrent adds. Existing
-        torrents keep the save path they were added with."""
+        torrents keep the save path they were added with. Also clears the
+        storage-unavailable state -- setting a usable path is how the user (or
+        a reconnected drive via a Settings re-apply) recovers the tab."""
         os.makedirs(path, exist_ok=True)
         self.default_save_path = path
+        self._unavailable_path = None
 
     def on_metadata_received(self, torrent_id, name, total_size, files):
         record = self.records.get(torrent_id)

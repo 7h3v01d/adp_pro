@@ -150,3 +150,36 @@ def test_torrent_methods_raise_503_without_torrent_support(qtbot, controller):
     with pytest.raises(ApiError) as exc_info:
         call_from_thread(qtbot, controller.list_torrents)
     assert exc_info.value.status_code == 503
+
+
+def test_api_default_path_uses_configured_download_dir(qtbot, controller, download_panel,
+                                                        mock_server, tmp_path):
+    """REST/MCP add-download without an explicit save_path must land the file
+    in the user's configured download_dir, the same as the GUI -- not the
+    app-data state dir. Regression: the controller used state_dir directly."""
+    configured = tmp_path / "MyConfiguredDownloads"
+    configured.mkdir()
+    download_panel.settings["download_dir"] = str(configured)
+
+    mock_server.add_file("viaapi.bin", b"x" * 500)
+    result = call_from_thread(
+        qtbot, controller.add_download, url=mock_server.url_for("viaapi.bin"))
+    # The chosen save_path must be under the configured folder.
+    assert result["save_path"].startswith(str(configured))
+    assert result["save_path"].endswith("viaapi.bin")
+
+
+def test_api_default_path_fails_closed_when_configured_dir_unavailable(
+        qtbot, controller, download_panel, mock_server, tmp_path):
+    """If the configured download folder is unavailable, the API must refuse
+    rather than silently redirecting to the system/app-data drive."""
+    from adp.api.controller import ApiError
+    # A path whose parent is a file can't be created -> unavailable.
+    blocker = tmp_path / "afile"
+    blocker.write_text("x")
+    download_panel.settings["download_dir"] = str(blocker / "sub")
+
+    mock_server.add_file("viaapi2.bin", b"y" * 500)
+    with pytest.raises(ApiError):
+        call_from_thread(qtbot, controller.add_download,
+                         url=mock_server.url_for("viaapi2.bin"))

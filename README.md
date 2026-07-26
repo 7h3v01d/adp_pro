@@ -1,4 +1,4 @@
-# ADP Pro
+# Accelerated Downloader Pro
 
 A multi-threaded, resumable download manager with a PyQt6 "Pro" GUI:
 categories, search/filter, per-download speed limits, scheduling,
@@ -174,9 +174,12 @@ If `pip install libtorrent` doesn't work for your platform:
 
 Settings live in `settings.json` in the per-user app-data dir
 (`%APPDATA%\AcceleratedDownloaderPro\` on Windows), created and managed by the
-app -- edit them through the in-app Settings dialog rather than by hand. The
-repo's `settings.example.json` documents every key and its default for
-reference; the app does not read that file.
+app. Most settings are edited through the in-app Settings dialog; a few
+advanced ones -- the Jackett indexer URL/API key and the API `api_port` -- are
+not yet surfaced in the dialog and are set by editing `settings.json` directly
+(the app picks them up on restart). The repo's `settings.example.json`
+documents every key and its default for reference; the app does not read that
+file.
 
 ## Running
 
@@ -191,8 +194,8 @@ adp-downloader
 ## Controlling it via API (REST or MCP)
 
 The app always runs a local REST API and an MCP server, both on the same
-port (default `8765`, configurable in Settings), bound to `127.0.0.1`
-only. Click **API Access** in the toolbar to get the base URL, MCP
+port (default `8765`, set via `api_port` in settings.json), bound to
+`127.0.0.1` only. Click **API Access** in the toolbar to get the base URL, MCP
 endpoint, and API key -- every request needs the key in an `X-API-Key`
 header, whichever interface you use.
 

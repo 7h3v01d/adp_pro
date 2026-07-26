@@ -27,6 +27,7 @@ from PyQt6.QtCore import Qt
 
 from adp.api.bridge import GuiBridge
 from adp.core.models import Status
+from adp.core.storage import ConfiguredPathUnavailableError
 from adp.utils.format import format_size, format_speed
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,15 @@ class AppController:
             raise ApiError("url is required")
         if not save_path:
             filename = os.path.basename(url.split("?")[0]) or "download"
-            save_path = os.path.join(self.download_panel.state_dir, filename)
+            # Use the SAME destination resolution as the GUI so REST/MCP land
+            # files in the user's configured download folder, not the app-data
+            # state dir. Fail closed if that folder is unavailable rather than
+            # silently redirecting elsewhere.
+            try:
+                base_dir = self.download_panel.resolve_download_dir()
+            except ConfiguredPathUnavailableError as e:
+                raise ApiError(str(e))
+            save_path = os.path.join(base_dir, filename)
         manager, widget = self.download_panel.add_download(
             url=url, save_path=save_path, category=category, num_threads=num_threads,
             checksum=checksum, speed_limit_bps=speed_limit_bps, verify_tls=verify_tls,

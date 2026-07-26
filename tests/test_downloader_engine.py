@@ -366,3 +366,58 @@ def test_tls_verification_opt_out_downloads_from_self_signed_server(qapp, thread
     assert manager.status == Status.COMPLETED
     with open(manager.save_path, 'rb') as f:
         assert f.read() == content
+
+
+@pytest.mark.timeout(60)
+def test_non_range_pause_resume_restarts_cleanly(qapp, thread_pool, mock_server, download_dir):
+    """A server without Range support can't resume: pause+resume must restart
+    the full GET from scratch AND reset the global byte counter. Regression --
+    the worker reset its own chunk to 0 but left manager.downloaded_size at the
+    pre-pause value, so the resumed full GET double-counted (e.g. 120MB for a
+    100MB file) and the exact-size check then declared the download broken."""
+    content = os.urandom(2_000_000)
+    mock_server.set_accept_ranges(False)   # force single-thread full-GET mode
+    mock_server.set_throttle("nr.bin", 600_000)
+    manager = make_manager(qapp, thread_pool, mock_server, download_dir,
+                           path="nr.bin", content=content, num_threads=4)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.DOWNLOADING and manager.downloaded_size > 0,
+                        timeout=40.0)
+    manager.pause()
+    assert pump_events(qapp, lambda: manager.status == Status.PAUSED)
+    assert manager.downloaded_size > 0   # some bytes landed before pause
+
+    # Remove the throttle so the restarted download can finish promptly.
+    mock_server.set_throttle("nr.bin", 0)
+    manager.resume()
+    assert pump_events(qapp, lambda: manager.status.is_terminal, timeout=20)
+    assert manager.status == Status.COMPLETED
+    # The counter must equal exactly the file size, not size + pre-pause bytes.
+    assert manager.downloaded_size == len(content)
+    with open(manager.save_path, "rb") as f:
+        assert f.read() == content
+
+
+@pytest.mark.timeout(60)
+def test_non_range_restart_restarts_cleanly(qapp, thread_pool, mock_server, download_dir):
+    """Retrying (prepare_retry) a partially-done non-range download also
+    restarts cleanly with a correct final byte count."""
+    content = os.urandom(1_500_000)
+    mock_server.set_accept_ranges(False)
+    mock_server.set_throttle("nr2.bin", 500_000)
+    manager = make_manager(qapp, thread_pool, mock_server, download_dir,
+                           path="nr2.bin", content=content, num_threads=1)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.DOWNLOADING and manager.downloaded_size > 0,
+                        timeout=40.0)
+    manager.pause()
+    assert pump_events(qapp, lambda: manager.status == Status.PAUSED)
+
+    mock_server.set_throttle("nr2.bin", 0)
+    manager.prepare_retry()
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status.is_terminal, timeout=20)
+    assert manager.status == Status.COMPLETED
+    assert manager.downloaded_size == len(content)
+    with open(manager.save_path, "rb") as f:
+        assert f.read() == content

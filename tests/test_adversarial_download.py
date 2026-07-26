@@ -61,6 +61,20 @@ class TestRangeDefenses:
             manager = _run(qapp, thread_pool, download_dir, server.url)
         assert manager.status == Status.ERROR
 
+    def test_wrong_content_range_end_is_rejected(self, qapp, thread_pool, download_dir):
+        """A 206 with the right start but a different end than requested is a
+        contract violation -- the server handed us a slice we didn't ask for."""
+        with EvilServer("wrong_content_range_end") as server:
+            manager = _run(qapp, thread_pool, download_dir, server.url)
+        assert manager.status == Status.ERROR
+
+    def test_wrong_content_range_total_is_rejected(self, qapp, thread_pool, download_dir):
+        """A 206 whose reported total differs from the download's known size
+        means the resource changed under us; reject rather than splice."""
+        with EvilServer("wrong_content_range_total") as server:
+            manager = _run(qapp, thread_pool, download_dir, server.url)
+        assert manager.status == Status.ERROR
+
     def test_oversending_server_does_not_overflow_file(self, qapp, thread_pool, download_dir):
         """A server that streams more than the requested range must not push
         the output past the expected size. Either it's capped to the correct

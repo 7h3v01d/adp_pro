@@ -39,6 +39,27 @@ logger = logging.getLogger(__name__)
 
 _CATEGORY_CHOICES = ["Any", "software", "video", "audio", "books", "games", "other"]
 
+# Stored on the title item so actions (Add / double-click / context menu)
+# resolve the right SearchResult even after the user re-sorts the table --
+# indexing by visual row would resolve the wrong result once sorted.
+_RESULT_INDEX_ROLE = Qt.ItemDataRole.UserRole
+
+
+class _SortKeyItem(QTableWidgetItem):
+    """A table cell whose *display* is human-readable text ("4.56 GB", "1240")
+    but whose *sort* uses a stored numeric key. Without this, Qt sorts these
+    columns as strings -- "667 MB" would sort above "4.56 GB", and "1240"
+    below "305" -- which is wrong for sizes and counts."""
+
+    def __init__(self, text: str, sort_key: float):
+        super().__init__(text)
+        self._sort_key = sort_key
+
+    def __lt__(self, other):
+        if isinstance(other, _SortKeyItem):
+            return self._sort_key < other._sort_key
+        return super().__lt__(other)
+
 
 class SearchWorker(QThread):
     """Runs one search off the GUI thread."""
@@ -96,12 +117,31 @@ class SearchPanel(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
+        # Interactive = user can drag any column border to resize. Title
+        # stretches to fill leftover space but stays draggable; the rest get
+        # sensible starting widths.
         header.setSectionResizeMode(self.COL_TITLE, QHeaderView.ResizeMode.Stretch)
-        for col in (self.COL_SIZE, self.COL_SEEDERS, self.COL_LEECHERS, self.COL_SOURCES, self.COL_ADD):
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        for col in (self.COL_SIZE, self.COL_SEEDERS, self.COL_LEECHERS, self.COL_SOURCES):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(self.COL_SIZE, 90)
+        self.table.setColumnWidth(self.COL_SEEDERS, 80)
+        self.table.setColumnWidth(self.COL_LEECHERS, 80)
+        self.table.setColumnWidth(self.COL_SOURCES, 140)
+        # The Add-button column is fixed and not draggable/sortable.
+        header.setSectionResizeMode(self.COL_ADD, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_ADD, 70)
+        # Click a header to sort; click again to reverse. Numeric columns sort
+        # numerically (see SortKeyItem below), not as text.
+        self.table.setSortingEnabled(True)
+        header.setSortIndicatorShown(True)
+        header.setSectionsClickable(True)
+        # Default sort: best results first (Seeders, descending) -- the ranker
+        # already orders results, this just reflects it in the header.
+        self.table.sortItems(self.COL_SEEDERS, Qt.SortOrder.DescendingOrder)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
-        self.table.itemDoubleClicked.connect(lambda item: self.add_result_to_torrents(item.row()))
+        self.table.itemDoubleClicked.connect(
+            lambda item: self.add_result_to_torrents(self._row_result_index(item.row())))
         layout.addWidget(self.table)
 
         # -- status line --------------------------------------------------
@@ -166,23 +206,34 @@ class SearchPanel(QWidget):
         self.result_summary.setText(f"Search failed: {message}")
 
     def _populate_table(self, results: List[SearchResult]):
+        # Disable sorting while we fill -- otherwise Qt re-sorts on every
+        # setItem and rows shuffle under us mid-population. Re-enable after.
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         self.table.setRowCount(len(results))
         for row, result in enumerate(results):
             title_item = QTableWidgetItem(result.title)
             title_item.setToolTip(result.title)
+            # Stash the index into self._results so actions resolve the right
+            # result regardless of how the view is later sorted.
+            title_item.setData(_RESULT_INDEX_ROLE, row)
             self.table.setItem(row, self.COL_TITLE, title_item)
 
             size_text = format_size(result.size_bytes) if result.size_bytes else "--"
-            for col, text in (
-                (self.COL_SIZE, size_text),
-                (self.COL_SEEDERS, str(result.seeders)),
-                (self.COL_LEECHERS, str(result.leechers)),
-                (self.COL_SOURCES, ", ".join(sorted({s.provider for s in result.sources}))),
-            ):
-                item = QTableWidgetItem(text)
+            # (column, display text, numeric sort key)
+            numeric_cells = (
+                (self.COL_SIZE, size_text, float(result.size_bytes or 0)),
+                (self.COL_SEEDERS, str(result.seeders), float(result.seeders)),
+                (self.COL_LEECHERS, str(result.leechers), float(result.leechers)),
+            )
+            for col, text, sort_key in numeric_cells:
+                item = _SortKeyItem(text, sort_key)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, col, item)
+
+            sources_item = QTableWidgetItem(", ".join(sorted({s.provider for s in result.sources})))
+            sources_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, self.COL_SOURCES, sources_item)
 
             add_button = QPushButton("Add", self.table)
             add_button.setObjectName("secondary")
@@ -191,10 +242,36 @@ class SearchPanel(QWidget):
                 add_button.setToolTip("Torrent support isn't available (libtorrent missing).")
             else:
                 add_button.setToolTip("Add to the Torrents tab and start downloading")
-                add_button.clicked.connect(lambda _checked=False, r=row: self.add_result_to_torrents(r))
+                # Resolve the result from the button's current row at click
+                # time (not a captured row), so sorting can't misroute it.
+                add_button.clicked.connect(
+                    lambda _checked=False, b=add_button: self.add_result_to_torrents(
+                        self._result_index_for_button(b)))
             self.table.setCellWidget(row, self.COL_ADD, add_button)
 
+        self.table.setSortingEnabled(True)
+
     # -- acting on results ------------------------------------------------
+    def _row_result_index(self, visual_row: int) -> int:
+        """Translate a *visual* table row (which changes when the user sorts)
+        into an index into self._results (which never moves). Reads the index
+        stashed on the title item. Returns -1 if the row is invalid."""
+        if visual_row < 0:
+            return -1
+        title_item = self.table.item(visual_row, self.COL_TITLE)
+        if title_item is None:
+            return -1
+        idx = title_item.data(_RESULT_INDEX_ROLE)
+        return int(idx) if idx is not None else -1
+
+    def _result_index_for_button(self, button) -> int:
+        """Find which result an in-cell Add button belongs to, by locating its
+        current visual row (buttons move with their row when sorted)."""
+        for visual_row in range(self.table.rowCount()):
+            if self.table.cellWidget(visual_row, self.COL_ADD) is button:
+                return self._row_result_index(visual_row)
+        return -1
+
     def _result_at(self, row: int) -> Optional[SearchResult]:
         if 0 <= row < len(self._results):
             return self._results[row]
@@ -225,8 +302,9 @@ class SearchPanel(QWidget):
             self.status_update_requested.emit("Magnet link copied to clipboard.", 3000)
 
     def _show_context_menu(self, pos):
-        row = self.table.rowAt(pos.y())
-        if row < 0:
+        visual_row = self.table.rowAt(pos.y())
+        result_index = self._row_result_index(visual_row)
+        if result_index < 0:
             return
         menu = QMenu(self)
         add_action = menu.addAction("Add to Torrents")
@@ -234,6 +312,6 @@ class SearchPanel(QWidget):
         copy_action = menu.addAction("Copy Magnet Link")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is add_action:
-            self.add_result_to_torrents(row)
+            self.add_result_to_torrents(result_index)
         elif chosen is copy_action:
-            self.copy_magnet(row)
+            self.copy_magnet(result_index)

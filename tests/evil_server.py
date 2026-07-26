@@ -71,6 +71,34 @@ class _EvilHandler(BaseHTTPRequestHandler):
             self.wfile.write(EVIL_BODY[start:end + 1])
             return
 
+        if self.mode == "wrong_content_range_end":
+            # 206 with the right start but a wider end than requested, and a
+            # Content-Length consistent with that wider slice -- a fully
+            # self-consistent response for a slice we didn't ask for. Only the
+            # end-matching check catches this (the Content-Length cross-check
+            # can't, since the server made them agree).
+            start, end = rng if rng else (0, len(EVIL_BODY) - 1)
+            lied_end = min(end + 5000, len(EVIL_BODY) - 1)
+            self.send_response(206)
+            self.send_header("Content-Length", str(lied_end - start + 1))
+            self.send_header("Content-Range",
+                             f"bytes {start}-{lied_end}/{len(EVIL_BODY)}")
+            self.end_headers()
+            self.wfile.write(EVIL_BODY[start:lied_end + 1])
+            return
+
+        if self.mode == "wrong_content_range_total":
+            # 206 whose reported total differs from what the download is based
+            # on -- the resource changed size under us.
+            start, end = rng if rng else (0, len(EVIL_BODY) - 1)
+            self.send_response(206)
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Content-Range",
+                             f"bytes {start}-{end}/{len(EVIL_BODY) + 999999}")
+            self.end_headers()
+            self.wfile.write(EVIL_BODY[start:end + 1])
+            return
+
         if self.mode == "no_content_range":
             # 206 status but omits Content-Range entirely.
             start, end = rng if rng else (0, len(EVIL_BODY) - 1)

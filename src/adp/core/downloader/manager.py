@@ -62,6 +62,13 @@ class DownloadManager(QObject):
 
         self.total_size = 0
         self.downloaded_size = 0
+        # Whether start() has run and fetched metadata (total_size, range
+        # support, restored progress). A runtime pause happens after this is
+        # True, so resume() can respawn workers directly. But a download
+        # *restored from a saved session as paused* has never run start(): it
+        # has total_size=0 and no metadata, so resume() must route it through
+        # start() first rather than spawning workers against a 0-byte file.
+        self.metadata_initialized = False
         self.workers = []
         self.active_workers = 0
         self.start_time = None
@@ -171,6 +178,7 @@ class DownloadManager(QObject):
         self.total_size = total_size
         self.server_etag = etag
         self.server_last_modified = last_modified
+        self.metadata_initialized = True
 
         if self.total_size <= 0:
             self.handle_metadata_error("Could not determine file size.")
@@ -204,6 +212,27 @@ class DownloadManager(QObject):
 
     def _spawn_workers(self):
         self.active_workers = 0
+        # A server without Range support can't resume: the only option is a
+        # fresh full GET. If we have partial progress (a paused/restarted
+        # non-range download), reset the GLOBAL counters and the file here,
+        # before spawning -- otherwise the single full-GET worker adds another
+        # whole-file's worth on top of the old downloaded_size, blowing the
+        # exact-size check. This must happen at the manager level: the worker
+        # can only reset its own chunk, not the manager's downloaded_size.
+        if not getattr(self, 'ranges_supported', True) and self.downloaded_size:
+            logger.info(
+                f"[{self.filename}] Server has no range support; restarting the "
+                f"download from scratch (can't resume a non-range transfer).")
+            self.chunk_progress = {}
+            self.downloaded_size = 0
+            self.downloaded_at_start = 0
+            try:
+                with open(self.save_path, 'wb') as f:
+                    if self.total_size > 0:
+                        f.seek(self.total_size - 1)
+                        f.write(b'\0')
+            except OSError as e:
+                logger.error(f"Could not reset file for non-range restart: {e}")
         chunk_size = self.total_size // self.num_threads
         for i in range(self.num_threads):
             start = i * chunk_size
@@ -392,6 +421,14 @@ class DownloadManager(QObject):
 
     def resume(self):
         if self.status == Status.PAUSED:
+            if not self.metadata_initialized:
+                # Restored-from-session pause: never ran start(), so total_size
+                # is 0 and there's no range info. Go through the normal start
+                # path, which fetches metadata and calls load_progress() to
+                # restore partial bytes from the .progress sidecar, then spawns
+                # workers. Spawning directly here would divide a 0-byte file.
+                self.start()
+                return
             self.start_time = time.time()
             self.downloaded_at_start = self.downloaded_size
             self.speed_history.clear()

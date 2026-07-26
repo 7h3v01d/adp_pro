@@ -248,6 +248,17 @@ class TorrentEngine(QObject):
             handle.set_flags(lt.torrent_flags.auto_managed)
             handle.resume()
         handle.force_recheck()
+        # A recheck can leave the torrent needing to refetch pieces (data was
+        # missing or failed verification). Re-announce to trackers/DHT so it
+        # rebuilds its peer list promptly instead of sitting in DOWNLOADING
+        # with no peers and a rate that decays to zero -- which shows up as an
+        # ETA that climbs forever and a torrent that "never finishes".
+        try:
+            handle.force_reannounce()
+        except Exception:
+            # Best-effort: some handles (e.g. no trackers, magnet not yet
+            # resolved) can't reannounce, and that must not fail the recheck.
+            logger.debug("force_reannounce after recheck skipped for %s", torrent_id)
         return True
 
     def connect_peer(self, torrent_id: str, ip: str, port: int):

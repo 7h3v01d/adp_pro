@@ -65,24 +65,29 @@ class MainWindow(QMainWindow):
 
         if TORRENT_SUPPORT_AVAILABLE:
             default_torrent_dir = os.path.join(state_dir, "torrent_downloads")
+            torrent_dir = None
+            unavailable_path = None
             try:
                 torrent_dir = resolve_dir(
                     settings.get("torrent_download_dir"), default_torrent_dir)
             except ConfiguredPathUnavailableError as e:
-                # At construction there's no status bar yet and we must not
-                # crash startup. Fall back to the default location but log
-                # loudly; the user will also see the failure the next time
-                # they open Settings or add a torrent.
-                logger.warning("Configured torrent folder unavailable at startup, "
-                               "using default: %s", e)
-                os.makedirs(default_torrent_dir, exist_ok=True)
-                torrent_dir = default_torrent_dir
+                # Fail closed: the user configured a torrent folder that's
+                # currently unavailable (e.g. unplugged drive). We do NOT
+                # silently redirect downloads to the system drive -- that
+                # would defeat storage.py's whole purpose. The tab opens in a
+                # "storage unavailable" state instead: Add is blocked and the
+                # UI names the missing path, so the user's storage decision
+                # survives. They recover by reconnecting the drive or picking
+                # another folder in Settings.
+                logger.warning("Configured torrent folder unavailable at startup: %s", e)
+                unavailable_path = e.configured
             self.torrent_panel = TorrentPanel(
                 self, state_dir=state_dir,
                 listen_port=settings.get("torrent_listen_port", 6881),
                 enable_dht=settings.get("torrent_enable_dht", True),
                 default_seed_ratio_limit=settings.get("torrent_default_seed_ratio_limit", 0.0),
                 default_save_path=torrent_dir,
+                unavailable_path=unavailable_path,
             )
             self.tabs.addTab(self.torrent_panel, "Torrents")
             self.torrent_panel.status_update_requested.connect(self.statusBar().showMessage)

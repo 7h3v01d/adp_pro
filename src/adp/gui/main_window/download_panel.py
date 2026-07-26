@@ -288,14 +288,19 @@ class DownloadPanel(QWidget):
             self.scheduler.unschedule(download_id)
             self._on_schedule_due(download_id)
 
-    def _download_dir(self) -> str:
-        """The resolved default download folder for the Add dialog: the user's
-        configured download_dir when set and usable, else a Downloads folder
-        under the state dir. Raises ConfiguredPathUnavailableError if the user
-        configured a location that's currently unreachable -- the caller shows
-        that to the user rather than silently redirecting to the system drive."""
+    def resolve_download_dir(self) -> str:
+        """The resolved default download folder, shared by the GUI Add dialog
+        and the REST/MCP controller so every surface lands files in the same
+        place: the user's configured download_dir when set and usable, else a
+        Downloads folder under the state dir. Raises
+        ConfiguredPathUnavailableError if the configured location is currently
+        unreachable -- the caller surfaces that rather than silently
+        redirecting to the system drive."""
         return resolve_dir(self.settings.get("download_dir"),
                             os.path.join(self.state_dir, "downloads"))
+
+    # Back-compat alias for existing internal callers.
+    _download_dir = resolve_download_dir
 
     def add_download_from_dialog(self):
         try:
@@ -306,6 +311,7 @@ class DownloadPanel(QWidget):
             return
         dialog = AddDownloadDialog(self, thread_pool=self.thread_pool,
                                     default_speed_limit_bps=self.settings.get("default_speed_limit_bps", 0),
+                                    default_verify_tls=self.settings.get("verify_tls", True),
                                     default_dir=default_dir)
         if dialog.exec():
             data = dialog.get_data()
@@ -375,12 +381,15 @@ class DownloadPanel(QWidget):
         return selected_items[0].data(Qt.ItemDataRole.UserRole) if selected_items else None
 
     def _find_active_manager_for_path(self, save_path):
-        """Returns an existing manager already writing to (or paused on)
-        save_path, if any -- used to prevent two managers from ever holding
-        open file handles to the same file at once."""
+        """Returns an existing non-terminal manager already targeting save_path,
+        if any -- used to prevent two managers from ever writing to the same
+        file. A destination is reserved the moment a job is accepted (PENDING,
+        QUEUED/scheduled, PAUSED, STARTING, DOWNLOADING), not only once its
+        first worker starts: otherwise two PENDING or scheduled downloads with
+        the same path both get accepted and collide when they start."""
         target = os.path.normcase(os.path.abspath(save_path))
         for manager in self.downloads.values():
-            if manager.status.is_active or manager.status == Status.PAUSED:
+            if not manager.status.is_terminal:
                 if os.path.normcase(os.path.abspath(manager.save_path)) == target:
                     return manager
         return None
@@ -400,8 +409,22 @@ class DownloadPanel(QWidget):
 
     def resume_selected_download(self):
         download_id = self.get_selected_download_id()
-        if download_id and download_id in self.downloads:
-            self.downloads[download_id].resume()
+        if not (download_id and download_id in self.downloads):
+            return
+        manager = self.downloads[download_id]
+        if not manager.metadata_initialized:
+            # Restored-from-session pause: this job never occupied a
+            # concurrency slot. Resuming it is really "start it", so route it
+            # through the queue/accounting like any fresh start, honouring the
+            # max-active limit. Its resume() will take the start() path.
+            manager.set_status(Status.PENDING)
+            if manager not in self.download_queue:
+                self.download_queue.append(manager)
+            self.process_queue()
+        else:
+            # Runtime pause -> resume: the slot was counted at start and held
+            # across the pause, so just resume in place.
+            manager.resume()
 
     def stop_selected_download(self):
         download_id = self.get_selected_download_id()
