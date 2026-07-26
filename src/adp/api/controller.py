@@ -118,7 +118,9 @@ class AppController:
 
     def _pause_download_impl(self, download_id: str) -> dict:
         manager = self._require_download(download_id)
-        manager.pause()
+        # Route through the panel so the API obeys the same lifecycle policy
+        # as the GUI (the panel owns concurrency/slot accounting).
+        self.download_panel.pause_download(download_id)
         return self._serialize_download(manager)
 
     def resume_download(self, download_id: str) -> dict:
@@ -126,7 +128,9 @@ class AppController:
 
     def _resume_download_impl(self, download_id: str) -> dict:
         manager = self._require_download(download_id)
-        manager.resume()
+        # Panel-level resume respects the restored-pause queue logic and slot
+        # accounting instead of bypassing it with a direct manager.resume().
+        self.download_panel.resume_download(download_id)
         return self._serialize_download(manager)
 
     def stop_download(self, download_id: str) -> dict:
@@ -134,9 +138,7 @@ class AppController:
 
     def _stop_download_impl(self, download_id: str) -> dict:
         manager = self._require_download(download_id)
-        if manager.status in (Status.DOWNLOADING, Status.PAUSED, Status.STARTING):
-            manager.stop()
-            self.download_panel.finish_download_slot(download_id)
+        self.download_panel.stop_download(download_id)
         return self._serialize_download(manager)
 
     def retry_download(self, download_id: str) -> dict:
@@ -145,14 +147,14 @@ class AppController:
     def _retry_download_impl(self, download_id: str) -> dict:
         manager = self._require_download(download_id)
         if manager.status in (Status.ERROR, Status.STOPPED, Status.COMPLETED):
-            # Same single-path retry the GUI uses: reset to PENDING and let
-            # process_queue start it under the concurrency limit, rather than
-            # starting it directly (which ran outside the limit and dropped
-            # the un-decremented manager from the queue).
-            manager.prepare_retry()
-            if manager not in self.download_panel.download_queue:
-                self.download_panel.download_queue.append(manager)
-            self.download_panel.process_queue()
+            # Route through the panel so the API obeys the same concurrency and
+            # path-reservation policy as the GUI rather than starting the
+            # manager directly. A destination conflict is reported as an error.
+            accepted = self.download_panel.retry_download(download_id)
+            if not accepted:
+                raise ApiError(
+                    "Retry was refused -- the download's destination is currently "
+                    "reserved by another active download. Remove or redirect it first.")
         return self._serialize_download(manager)
 
     def remove_download(self, download_id: str) -> dict:

@@ -53,7 +53,12 @@ class DownloadPanel(QWidget):
             self.thread_pool.setMaxThreadCount(16)
         self.downloads: dict[str, DownloadManager] = {}
         self.download_queue = deque()
-        self.active_downloads = 0
+        # The set of download_ids that currently hold a concurrency slot.
+        # Using a set (not a bare counter) makes acquire/release idempotent, so
+        # a double completion callback, or removing a restored-paused download
+        # that never held a slot, can't corrupt the count. active_downloads is
+        # derived from this, keeping the concurrency invariant robust.
+        self._slot_holders: set[str] = set()
 
         state_dir = state_dir or os.getcwd()
         self.state_dir = state_dir
@@ -317,12 +322,23 @@ class DownloadPanel(QWidget):
             data = dialog.get_data()
             self.add_download(**data)
 
+    @property
+    def active_downloads(self) -> int:
+        """Number of downloads currently holding a concurrency slot."""
+        return len(self._slot_holders)
+
+    def _acquire_slot(self, download_id: str) -> None:
+        self._slot_holders.add(download_id)  # idempotent
+
+    def _release_slot(self, download_id: str) -> None:
+        self._slot_holders.discard(download_id)  # idempotent; no-op if not held
+
     def process_queue(self):
         max_active = self.concurrency_spinbox.value()
-        while self.active_downloads < max_active and self.download_queue:
+        while len(self._slot_holders) < max_active and self.download_queue:
             manager = self.download_queue.popleft()
             if manager.status == Status.PENDING:
-                self.active_downloads += 1
+                self._acquire_slot(manager.download_id)
                 manager.start()
 
     # -- filtering ----------------------------------------------------------
@@ -372,7 +388,9 @@ class DownloadPanel(QWidget):
 
     def finish_download_slot(self, download_id):
         if download_id in self.downloads:
-            self.active_downloads = max(0, self.active_downloads - 1)
+            # Release this download's slot (idempotent -- a double callback or a
+            # download that never held a slot is harmless) and pull the queue.
+            self._release_slot(download_id)
             self.process_queue()
 
     # -- selection helpers ---------------------------------------------------
@@ -380,19 +398,25 @@ class DownloadPanel(QWidget):
         selected_items = self.download_list.selectedItems()
         return selected_items[0].data(Qt.ItemDataRole.UserRole) if selected_items else None
 
-    def _find_active_manager_for_path(self, save_path):
+    def _find_path_conflict(self, save_path, exclude_download_id=None):
         """Returns an existing non-terminal manager already targeting save_path,
-        if any -- used to prevent two managers from ever writing to the same
-        file. A destination is reserved the moment a job is accepted (PENDING,
-        QUEUED/scheduled, PAUSED, STARTING, DOWNLOADING), not only once its
-        first worker starts: otherwise two PENDING or scheduled downloads with
-        the same path both get accepted and collide when they start."""
+        if any -- the shared destination-reservation check used by BOTH adding
+        a new download and retrying/resurrecting a terminal one. A destination
+        is reserved the moment a job is accepted (PENDING, QUEUED/scheduled,
+        PAUSED, STARTING, DOWNLOADING); terminal jobs (COMPLETED/ERROR/STOPPED)
+        release their reservation. exclude_download_id skips the job being
+        transitioned itself (so retry doesn't conflict with its own record)."""
         target = os.path.normcase(os.path.abspath(save_path))
         for manager in self.downloads.values():
+            if exclude_download_id is not None and manager.download_id == exclude_download_id:
+                continue
             if not manager.status.is_terminal:
                 if os.path.normcase(os.path.abspath(manager.save_path)) == target:
                     return manager
         return None
+
+    # Back-compat alias for the add-download path.
+    _find_active_manager_for_path = _find_path_conflict
 
     def find_widget(self, download_id):
         for i in range(self.download_list.count()):
@@ -404,13 +428,27 @@ class DownloadPanel(QWidget):
     # -- per-download controls -----------------------------------------------
     def pause_selected_download(self):
         download_id = self.get_selected_download_id()
-        if download_id and download_id in self.downloads:
+        if download_id:
+            self.pause_download(download_id)
+
+    def pause_download(self, download_id) -> bool:
+        """Pause a download. Panel-level authority, called by GUI and API."""
+        if download_id in self.downloads:
             self.downloads[download_id].pause()
+            return True
+        return False
 
     def resume_selected_download(self):
         download_id = self.get_selected_download_id()
-        if not (download_id and download_id in self.downloads):
-            return
+        if download_id:
+            self.resume_download(download_id)
+
+    def resume_download(self, download_id) -> bool:
+        """Resume a download under the panel's concurrency policy. The single
+        authority for resume, called by both GUI and API so REST/MCP can't
+        bypass the restored-pause queue logic."""
+        if download_id not in self.downloads:
+            return False
         manager = self.downloads[download_id]
         if not manager.metadata_initialized:
             # Restored-from-session pause: this job never occupied a
@@ -425,35 +463,59 @@ class DownloadPanel(QWidget):
             # Runtime pause -> resume: the slot was counted at start and held
             # across the pause, so just resume in place.
             manager.resume()
+        return True
 
     def stop_selected_download(self):
         download_id = self.get_selected_download_id()
-        if download_id and download_id in self.downloads:
-            manager = self.downloads[download_id]
-            if manager.status in [Status.DOWNLOADING, Status.PAUSED, Status.STARTING]:
-                manager.stop()
-                self.finish_download_slot(download_id)
-                widget = self.find_widget(download_id)
-                if widget:
-                    widget.set_final_status("Stopped")
+        if download_id:
+            self.stop_download(download_id)
+
+    def stop_download(self, download_id) -> bool:
+        """Stop a download and release its slot. Panel-level authority."""
+        if download_id not in self.downloads:
+            return False
+        manager = self.downloads[download_id]
+        if manager.status in [Status.DOWNLOADING, Status.PAUSED, Status.STARTING]:
+            manager.stop()
+            self.finish_download_slot(download_id)
+            widget = self.find_widget(download_id)
+            if widget:
+                widget.set_final_status("Stopped")
+            return True
+        return False
 
     def retry_selected_download(self):
         download_id = self.get_selected_download_id()
-        if not (download_id and download_id in self.downloads):
-            return
+        if download_id:
+            self.retry_download(download_id)
+
+    def retry_download(self, download_id) -> bool:
+        """Retry a terminal download under the panel's concurrency + path-
+        reservation policy. The single authority for retrying, called by both
+        the GUI and the REST/MCP controller so the API can't bypass the rules.
+        Returns True if the retry was accepted."""
+        if download_id not in self.downloads:
+            return False
         manager = self.downloads[download_id]
         if manager.status not in (Status.ERROR, Status.STOPPED, Status.COMPLETED):
-            return
+            return False
+        # A terminal job released its path reservation, so another download may
+        # have since claimed the same destination. Re-check before resurrecting
+        # this one into PENDING -- otherwise retry re-creates the very
+        # two-managers-one-file collision the reservation exists to prevent.
+        conflict = self._find_path_conflict(manager.save_path, exclude_download_id=download_id)
+        if conflict is not None:
+            self.status_update_requested.emit(
+                f"Can't retry: '{os.path.basename(manager.save_path)}' is now targeted by "
+                "another active download. Remove or redirect that one first.", 8000)
+            return False
         # Reset to PENDING and let process_queue be the single owner of
-        # starting downloads and incrementing active_downloads. Previously
-        # this both queued the manager AND called manager.retry() directly:
-        # process_queue would drop the non-PENDING manager without starting
-        # or counting it, and the direct start ran it *outside* the
-        # concurrency limit -- and a COMPLETED retry did nothing at all.
+        # starting downloads and incrementing active_downloads.
         manager.prepare_retry()
         if manager not in self.download_queue:
             self.download_queue.append(manager)
         self.process_queue()
+        return True
 
     def remove_selected_download(self):
         selected_items = self.download_list.selectedItems()
@@ -531,27 +593,43 @@ class DownloadPanel(QWidget):
             ))
         self.session_store.save(records)
 
+    # Statuses that must be restored exactly as saved, NOT resurrected into
+    # the queue. A COMPLETED download must not re-download; a STOPPED one must
+    # stay stopped (stop() even deleted its .progress sidecar); an ERROR one
+    # stays failed until the user explicitly retries. Only PENDING/QUEUED
+    # (incl. formerly-active jobs mapped to PENDING on save) actually re-enter
+    # the queue.
+    _RESTORE_AS_IS = {Status.COMPLETED, Status.STOPPED, Status.ERROR, Status.PAUSED}
+
     def load_downloads(self):
         for record in self.session_store.load():
             # Restore with the ORIGINAL id so the .progress sidecar and any
-            # external controllers still line up. A job saved as PAUSED is
-            # restored paused; a recoverable (formerly active) job is restored
-            # pending and resumes automatically via process_queue().
-            restore_paused = (record.status == Status.PAUSED.name)
+            # external controllers still line up.
             self.add_download(
                 url=record.url, save_path=record.save_path, checksum=record.checksum,
                 num_threads=record.num_threads, headers=record.headers, category=record.category,
                 speed_limit_bps=record.speed_limit_bps, scheduled_time=record.scheduled_time,
                 start_immediately=False, download_id=record.download_id,
             )
-            if restore_paused:
-                manager = self.downloads.get(record.download_id)
-                if manager is not None:
-                    # Keep it paused rather than auto-queuing it: the user
-                    # paused it, that intent should survive the restart.
-                    if manager in self.download_queue:
-                        self.download_queue.remove(manager)
-                    manager.set_status(Status.PAUSED)
+            manager = self.downloads.get(record.download_id)
+            if manager is None:
+                continue
+            try:
+                saved_status = Status[record.status]
+            except (KeyError, TypeError):
+                saved_status = Status.PENDING
+            if saved_status in self._RESTORE_AS_IS:
+                # Pull it out of the queue (add_download enqueues unscheduled
+                # jobs) and pin it to its saved terminal/paused status so
+                # process_queue() below won't start it. For terminal states we
+                # also restore the persisted byte figures so the row reads
+                # correctly without re-fetching anything.
+                if manager in self.download_queue:
+                    self.download_queue.remove(manager)
+                if saved_status in (Status.COMPLETED, Status.ERROR):
+                    manager.total_size = record.total_size or 0
+                    manager.downloaded_size = record.downloaded_size or 0
+                manager.set_status(saved_status)
         self.process_queue()
 
     def apply_settings(self, new_settings: dict):

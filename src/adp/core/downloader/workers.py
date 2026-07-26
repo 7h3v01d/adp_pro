@@ -255,6 +255,13 @@ class DownloadWorker(QRunnable):
                                 break
                             if self.speed_limiter is not None:
                                 self.speed_limiter.acquire(len(chunk))
+                                # The limiter can block (sleep) for a while. If
+                                # the user paused/stopped/retried during that
+                                # sleep, the epoch moved on -- re-check before
+                                # writing so we don't commit one stale chunk
+                                # after a pause. Small window, but real.
+                                if self._is_stale():
+                                    return
                             f.write(chunk)
                             bytes_this_run += len(chunk)
                             remaining -= len(chunk)
