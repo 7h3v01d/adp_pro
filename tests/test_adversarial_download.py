@@ -75,6 +75,13 @@ class TestRangeDefenses:
             manager = _run(qapp, thread_pool, download_dir, server.url)
         assert manager.status == Status.ERROR
 
+    def test_unknown_total_is_rejected(self, qapp, thread_pool, download_dir):
+        """A 206 with an unknown total (bytes start-end/*) on a sized resumable
+        download must be rejected -- we can't confirm the resource is unchanged."""
+        with EvilServer("unknown_total") as server:
+            manager = _run(qapp, thread_pool, download_dir, server.url)
+        assert manager.status == Status.ERROR
+
     def test_oversending_server_does_not_overflow_file(self, qapp, thread_pool, download_dir):
         """A server that streams more than the requested range must not push
         the output past the expected size. Either it's capped to the correct

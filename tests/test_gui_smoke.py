@@ -534,3 +534,205 @@ def test_removing_restored_paused_does_not_free_another_slot(qtbot, tmp_path, mo
     panel.remove_selected_download()
     assert panel.active_downloads == 1  # A still holds its slot, invariant intact
     assert a.download_id in panel._slot_holders
+
+
+def _make_terminal(panel, mock_server, download_dir, name, status):
+    save = os.path.join(download_dir, name)
+    m, _ = panel.add_download(mock_server.url_for(name), save,
+                              num_threads=1, start_immediately=False)
+    m.set_status(status)
+    return m
+
+
+def test_resume_completed_is_rejected(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """RC blocker: resume must refuse a COMPLETED download -- only PAUSED can
+    resume. Otherwise an API caller tunnels a finished job back into active."""
+    mock_server.add_file("rc_done.bin", b"x" * 500)
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    m = _make_terminal(panel, mock_server, download_dir, "rc_done.bin", Status.COMPLETED)
+    # Clear any add-time queue membership so we're testing resume, not add.
+    if m in panel.download_queue:
+        panel.download_queue.remove(m)
+    assert panel.resume_download(m.download_id) is False
+    assert m.status == Status.COMPLETED
+    assert m not in panel.download_queue
+
+
+def test_resume_error_is_rejected(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    mock_server.add_file("rc_err.bin", b"x" * 500)
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    m = _make_terminal(panel, mock_server, download_dir, "rc_err.bin", Status.ERROR)
+    assert panel.resume_download(m.download_id) is False
+    assert m.status == Status.ERROR
+
+
+def test_resume_stopped_is_rejected(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    mock_server.add_file("rc_stop.bin", b"x" * 500)
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    m = _make_terminal(panel, mock_server, download_dir, "rc_stop.bin", Status.STOPPED)
+    assert panel.resume_download(m.download_id) is False
+    assert m.status == Status.STOPPED
+
+
+def test_resume_cannot_bypass_path_reservation_after_restart(qtbot, tmp_path, mock_server,
+                                                             download_dir, thread_pool):
+    """The full tunnel the reviewer described: A completes, B claims A's path
+    (allowed, A terminal), then resuming A must be refused -- otherwise A
+    bypasses the retry path-conflict check and both target the same file."""
+    mock_server.add_file("shared2.bin", b"z" * 500)
+    save = os.path.join(download_dir, "shared2.bin")
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    a, _ = panel.add_download(mock_server.url_for("shared2.bin"), save,
+                              num_threads=1, start_immediately=False)
+    a.set_status(Status.COMPLETED)
+    b, _ = panel.add_download(mock_server.url_for("shared2.bin"), save,
+                              num_threads=1, start_immediately=False)
+    assert b is not None  # allowed because A is terminal
+    # Resume A must be refused (it's COMPLETED, not PAUSED).
+    assert panel.resume_download(a.download_id) is False
+    assert a.status == Status.COMPLETED
+
+
+def test_remove_while_verifying_releases_slot(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """A VERIFYING download owns a concurrency slot. Removing it must release
+    that slot -- previously removal only handled DOWNLOADING/PAUSED/STARTING,
+    so a VERIFYING removal leaked the slot."""
+    mock_server.add_file("verifyslot.bin", b"v" * 1000)
+    panel = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel)
+    panel.concurrency_spinbox.setValue(1)
+
+    m, _ = panel.add_download(mock_server.url_for("verifyslot.bin"),
+                              os.path.join(download_dir, "verifyslot.bin"),
+                              num_threads=1, start_immediately=False)
+    # Simulate it holding a slot and being in VERIFYING.
+    panel._acquire_slot(m.download_id)
+    m.set_status(Status.VERIFYING)
+    assert panel.active_downloads == 1
+
+    # Select and remove it.
+    for row in range(panel.download_list.count()):
+        if panel.download_list.item(row).data(Qt.ItemDataRole.UserRole) == m.download_id:
+            panel.download_list.setCurrentRow(row)
+            break
+    panel.remove_selected_download()
+    # Slot released; the download is gone.
+    assert panel.active_downloads == 0
+    assert m.download_id not in panel._slot_holders
+    assert m.download_id not in panel.downloads
+
+
+def test_per_download_tls_policy_survives_restart(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """A per-download verify_tls=False decision must survive a restart, not
+    revert to the global default. Regression: DownloadRecord didn't persist
+    verify_tls."""
+    mock_server.add_file("tls.bin", b"x" * 500)
+    save_path = os.path.join(download_dir, "tls.bin")
+
+    panel1 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel1)
+    # Global default is verify (True); this download explicitly opts out.
+    panel1.settings["verify_tls"] = True
+    m, _ = panel1.add_download(mock_server.url_for("tls.bin"), save_path,
+                               num_threads=1, start_immediately=False, verify_tls=False)
+    assert m.verify_tls is False
+    panel1.save_downloads()
+
+    panel2 = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(panel2)
+    panel2.settings["verify_tls"] = True  # global still says verify
+    rid = panel2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = panel2.downloads[rid]
+    # The per-download decision (False) survived, not the global default (True).
+    assert restored.verify_tls is False
+
+
+# --- crash-recovery / durable-lifecycle suite ---------------------------
+# These simulate a crash by NOT calling closeEvent -- a fresh panel is built
+# from the same state_dir, exercising whether the last lifecycle decision was
+# persisted event-driven rather than only on clean shutdown.
+
+def _restart_panel(qtbot, tmp_path, thread_pool):
+    p = DownloadPanel(state_dir=str(tmp_path), thread_pool=thread_pool)
+    qtbot.addWidget(p)
+    return p
+
+
+def test_pause_survives_simulated_crash(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """pause -> (no clean close) -> restart: the job stays PAUSED."""
+    mock_server.add_file("crashpause.bin", os.urandom(1_000_000))
+    mock_server.set_throttle("crashpause.bin", 400_000)
+    save = os.path.join(download_dir, "crashpause.bin")
+    p1 = _restart_panel(qtbot, tmp_path, thread_pool)
+    m, _ = p1.add_download(mock_server.url_for("crashpause.bin"), save, num_threads=1)
+    assert _poll_until(qtbot, lambda: m.status == Status.DOWNLOADING and m.downloaded_size > 0)
+    p1.pause_download(m.download_id)  # event-driven save happens here
+    assert _poll_until(qtbot, lambda: m.status == Status.PAUSED)
+
+    # Simulate crash: build a new panel WITHOUT calling p1.closeEvent.
+    p2 = _restart_panel(qtbot, tmp_path, thread_pool)
+    rid = p2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    assert p2.downloads[rid].status == Status.PAUSED
+
+
+def test_remove_survives_simulated_crash(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """remove -> (no clean close) -> restart: the job stays gone."""
+    mock_server.add_file("crashremove.bin", b"x" * 500)
+    save = os.path.join(download_dir, "crashremove.bin")
+    p1 = _restart_panel(qtbot, tmp_path, thread_pool)
+    m, _ = p1.add_download(mock_server.url_for("crashremove.bin"), save,
+                           num_threads=1, start_immediately=False)
+    rid = m.download_id
+    p1.download_list.setCurrentRow(0)
+    p1.remove_selected_download()  # event-driven save happens here
+    assert rid not in p1.downloads
+
+    p2 = _restart_panel(qtbot, tmp_path, thread_pool)
+    assert p2.download_list.count() == 0
+    assert rid not in p2.downloads
+
+
+def test_restart_required_survives_restart(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """checksum ERROR (restart_required) -> restart -> retry restarts bytes,
+    not re-verify the same bad file. restart_required must be persisted."""
+    import hashlib
+    content = os.urandom(400_000)
+    mock_server.add_file("crashsum.bin", content)
+    save = os.path.join(download_dir, "crashsum.bin")
+    wrong = hashlib.sha256(b"wrong").hexdigest()
+    p1 = _restart_panel(qtbot, tmp_path, thread_pool)
+    m, _ = p1.add_download(mock_server.url_for("crashsum.bin"), save,
+                           num_threads=1, checksum=wrong)
+    assert _poll_until(qtbot, lambda: m.status == Status.ERROR, timeout_s=20)
+    assert m.restart_required is True
+
+    p2 = _restart_panel(qtbot, tmp_path, thread_pool)
+    rid = p2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = p2.downloads[rid]
+    assert restored.status == Status.ERROR
+    # The integrity-failure disposition survived the restart.
+    assert restored.restart_required is True
+
+
+def test_adp_ownership_survives_restart(qtbot, tmp_path, mock_server, download_dir, thread_pool):
+    """STOPPED ADP-created file -> restart -> retry can reclaim it (ownership
+    persisted), instead of refusing its own file as 'foreign'."""
+    content = os.urandom(500_000)
+    mock_server.add_file("crashown.bin", content)
+    save = os.path.join(download_dir, "crashown.bin")
+    p1 = _restart_panel(qtbot, tmp_path, thread_pool)
+    m, _ = p1.add_download(mock_server.url_for("crashown.bin"), save, num_threads=1)
+    # Let ADP create/claim the file, then stop.
+    assert _poll_until(qtbot, lambda: m.destination_owned_by_adp, timeout_s=20)
+    p1.stop_download(m.download_id)
+    assert _poll_until(qtbot, lambda: m.status == Status.STOPPED)
+
+    p2 = _restart_panel(qtbot, tmp_path, thread_pool)
+    rid = p2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = p2.downloads[rid]
+    # Ownership survived, so retry is allowed to reclaim ADP's own file.
+    assert restored.destination_owned_by_adp is True

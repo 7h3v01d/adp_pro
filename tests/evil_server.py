@@ -99,6 +99,18 @@ class _EvilHandler(BaseHTTPRequestHandler):
             self.wfile.write(EVIL_BODY[start:end + 1])
             return
 
+        if self.mode == "unknown_total":
+            # 206 with an unknown total ("bytes start-end/*"). For a sized,
+            # resumable, multi-part download we can't confirm the resource is
+            # unchanged, so this must be rejected.
+            start, end = rng if rng else (0, len(EVIL_BODY) - 1)
+            self.send_response(206)
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Content-Range", f"bytes {start}-{end}/*")
+            self.end_headers()
+            self.wfile.write(EVIL_BODY[start:end + 1])
+            return
+
         if self.mode == "no_content_range":
             # 206 status but omits Content-Range entirely.
             start, end = rng if rng else (0, len(EVIL_BODY) - 1)

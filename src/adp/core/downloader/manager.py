@@ -42,7 +42,8 @@ class DownloadManager(QObject):
     def __init__(self, download_id: str, url: str, save_path: str, thread_pool,
                  num_threads: int = 4, checksum: Optional[str] = None,
                  headers: Optional[Dict] = None, category: Optional[str] = None,
-                 speed_limit_bps: int = 0, verify_tls: bool = True):
+                 speed_limit_bps: int = 0, verify_tls: bool = True,
+                 allow_overwrite: bool = False):
         super().__init__()
         self.download_id = download_id
         self.url = url
@@ -52,6 +53,25 @@ class DownloadManager(QObject):
         self.thread_pool = thread_pool
         self.checksum = checksum
         self.headers = headers or BROWSER_HEADERS
+        # Whether we're allowed to truncate a pre-existing file at save_path
+        # that isn't a resumable ADP job. The panel only sets this once the
+        # user (GUI prompt) or an explicit API overwrite=true has authorized
+        # it. Guards against silently destroying an unrelated existing file.
+        self.allow_overwrite = allow_overwrite
+        # Whether ADP itself created/claimed the file at save_path (via a
+        # successful preallocation, or by adopting its own valid .progress).
+        # This is the basis for retry's overwrite rights: retrying may reuse a
+        # file ADP made, but must NOT gain blanket permission to overwrite a
+        # file that some other program created at the same path in the
+        # meantime. Distinct from allow_overwrite, which is an explicit
+        # user/API grant.
+        self.destination_owned_by_adp = False
+        # Set when a failure is an integrity problem (checksum mismatch,
+        # on-disk size mismatch) rather than a transient network error. A
+        # transient error can resume from partial bytes; an integrity error
+        # means the bytes on disk are wrong, so retry must restart from
+        # scratch instead of re-verifying the same bad file forever.
+        self.restart_required = False
         self.category = category or category_for_filename(self.filename)
         # TLS certificate verification. On by default; a per-download opt-out
         # exists for servers with broken/self-signed certs the user has
@@ -132,10 +152,39 @@ class DownloadManager(QObject):
                 logger.error(f"[{self.download_id}] Failed to load progress file: {e}", exc_info=True)
         return False
 
+    def _write_initial_progress(self):
+        """Write a zero-progress .progress sidecar right after the destination
+        file is created, so the file+sidecar pair is crash-consistent from the
+        start. Bypasses save_progress()'s status gate (we're in STARTING)."""
+        tmp_path = f"{self.progress_file}.tmp"
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump({
+                    'url': self.url, 'save_path': self.save_path,
+                    'total_size': self.total_size, 'etag': self.server_etag,
+                    'last_modified': self.server_last_modified,
+                    'chunk_progress': dict(self.chunk_progress),
+                }, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.progress_file)
+        except OSError as e:
+            logger.error(f"[{self.download_id}] Failed to write initial progress: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
     def save_progress(self):
         if self.status in [Status.DOWNLOADING, Status.PAUSED]:
+            tmp_path = f"{self.progress_file}.tmp"
             try:
-                with open(self.progress_file, 'w') as f:
+                # Atomic write: serialize to a temp file, flush to disk, then
+                # os.replace() into place. A crash mid-write can only leave the
+                # stale-but-valid old .progress or the .tmp, never a truncated
+                # half-written .progress that would fail to parse on restart.
+                with open(tmp_path, 'w') as f:
                     json.dump({
                         'url': self.url, 'save_path': self.save_path,
                         'total_size': self.total_size, 'etag': self.server_etag,
@@ -145,8 +194,16 @@ class DownloadManager(QObject):
                         # "dictionary changed size during iteration".
                         'chunk_progress': dict(self.chunk_progress)
                     }, f, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, self.progress_file)
             except OSError as e:
                 logger.error(f"[{self.download_id}] Failed to save progress: {e}", exc_info=True)
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
 
     # -- lifecycle -----------------------------------------------------
     def start(self):
@@ -189,7 +246,22 @@ class DownloadManager(QObject):
         else:
             self.ranges_supported = True
 
-        if not (os.path.exists(self.save_path) and self.load_progress()):
+        if os.path.exists(self.save_path) and self.load_progress():
+            # We adopted our own valid .progress for this file -- ADP owns it.
+            self.destination_owned_by_adp = True
+        else:
+            # The file either doesn't exist, or exists but has no valid
+            # matching ADP .progress sidecar. In the latter case, opening it
+            # 'wb' would silently truncate whatever is already there. Only do
+            # that if overwrite was explicitly authorized (GUI prompt, API
+            # overwrite=true, or a retry of an ADP-owned destination);
+            # otherwise fail safe.
+            if os.path.exists(self.save_path) and not self.allow_overwrite:
+                self.handle_metadata_error(
+                    f"A file already exists at {self.save_path} and it isn't a resumable "
+                    "download. Refusing to overwrite it. Choose another name, remove the "
+                    "existing file, or allow overwrite.")
+                return
             self.downloaded_size = 0
             self.chunk_progress = {}
             try:
@@ -199,6 +271,15 @@ class DownloadManager(QObject):
             except OSError:
                 with open(self.save_path, 'wb'):
                     pass
+            # ADP has now created the destination file, so it owns it.
+            self.destination_owned_by_adp = True
+            # Immediately write an initial .progress sidecar. Without this, a
+            # crash after preallocation but before the first periodic save
+            # would leave the file on disk with no matching progress, so
+            # restart would see "existing file, no valid progress" and refuse
+            # it. Writing the (zero-progress) sidecar now makes the pair
+            # crash-consistent from the moment the file exists.
+            self._write_initial_progress()
 
         if self.downloaded_size >= self.total_size:
             self.finish_download()
@@ -292,9 +373,11 @@ class DownloadManager(QObject):
         # This download's engine needs the file size up front (it splits the
         # file into ranged chunks), so a failed metadata fetch currently means
         # it can't proceed. Surface the plain-language reason rather than a
-        # raw exception string.
-        self.error_occurred.emit(self.download_id, error_message)
+        # raw exception string. Set the status BEFORE emitting so observers
+        # (e.g. the panel persisting the session on error) see ERROR, not the
+        # prior status.
         self.set_status(Status.ERROR)
+        self.error_occurred.emit(self.download_id, error_message)
 
     def on_chunk_downloaded(self, size: int):
         self.downloaded_size += size
@@ -321,6 +404,7 @@ class DownloadManager(QObject):
                 f"({self.downloaded_size}) != total_size ({self.total_size}) -- treating as an error. "
                 f"chunk_progress={self.chunk_progress}"
             )
+            self.restart_required = True  # on-disk bytes are wrong
             self.on_worker_error((RuntimeError, RuntimeError(
                 "Download finished with a byte count that doesn't match the expected size."), None))
             return
@@ -336,6 +420,7 @@ class DownloadManager(QObject):
         if on_disk != self.total_size:
             logger.error(
                 f"[{self.download_id}] On-disk size {on_disk} != expected {self.total_size}.")
+            self.restart_required = True  # file on disk is the wrong size
             self.on_worker_error((RuntimeError, RuntimeError(
                 f"Downloaded file is {on_disk} bytes, expected {self.total_size}."), None))
             return
@@ -343,7 +428,7 @@ class DownloadManager(QObject):
         logger.info(f"[{self.download_id}] All chunks complete ({self.downloaded_size} bytes).")
         if self.checksum:
             self.set_status(Status.VERIFYING)
-            checksum_worker = ChecksumWorker(self.save_path, self.checksum)
+            checksum_worker = ChecksumWorker(self.save_path, self.checksum, epoch=self.worker_epoch)
             checksum_worker.signals.finished.connect(self.on_verification_finished)
             checksum_worker.signals.error.connect(self.on_verification_error)
             self.thread_pool.start(checksum_worker)
@@ -353,7 +438,21 @@ class DownloadManager(QObject):
             self.download_finished.emit(self.download_id, self.filename)
             self.thread_pool.start(CleanupWorker(self.progress_file))
 
-    def on_verification_finished(self, is_valid: bool):
+    def on_verification_finished(self, is_valid: bool, epoch: int = None):
+        # Drop a stale result: a checksum worker can finish after the user
+        # stopped/removed the download (status guard), OR after a stop->retry
+        # cycle relaunched verification (epoch guard). Both must hold for the
+        # result to belong to the current run. Without the epoch check, Run 1's
+        # worker emitting while Run 2 is also VERIFYING would be wrongly
+        # accepted, since status alone can't tell the two runs apart.
+        if self.status != Status.VERIFYING:
+            logger.info(f"[{self.download_id}] Ignoring stale verification result "
+                        f"(status is {self.status.name}, not VERIFYING).")
+            return
+        if epoch is not None and epoch != self.worker_epoch:
+            logger.info(f"[{self.download_id}] Ignoring verification result from a "
+                        f"previous run (epoch {epoch} != {self.worker_epoch}).")
+            return
         if is_valid:
             logger.info(f"[{self.download_id}] Checksum verified OK: {self.save_path}")
             self.set_status(Status.COMPLETED)
@@ -363,14 +462,23 @@ class DownloadManager(QObject):
             logger.error(f"[{self.download_id}] Checksum verification FAILED for {self.save_path} "
                          f"(expected {self.checksum})")
             self.traceback_info = "Checksum verification failed."
-            self.error_occurred.emit(self.download_id, self.traceback_info)
+            self.restart_required = True  # bytes on disk are wrong; retry restarts
             self.set_status(Status.ERROR)
+            self.error_occurred.emit(self.download_id, self.traceback_info)
 
-    def on_verification_error(self, error_message: str):
+    def on_verification_error(self, error_message: str, epoch: int = None):
+        if self.status != Status.VERIFYING:
+            logger.info(f"[{self.download_id}] Ignoring stale verification error "
+                        f"(status is {self.status.name}).")
+            return
+        if epoch is not None and epoch != self.worker_epoch:
+            logger.info(f"[{self.download_id}] Ignoring verification error from a "
+                        f"previous run (epoch {epoch} != {self.worker_epoch}).")
+            return
         logger.error(f"[{self.download_id}] Checksum verification errored: {error_message}")
         self.traceback_info = error_message
-        self.error_occurred.emit(self.download_id, self.traceback_info)
         self.set_status(Status.ERROR)
+        self.error_occurred.emit(self.download_id, self.traceback_info)
 
     def on_worker_error(self, error_tuple):
         if len(error_tuple) == 4:
@@ -387,8 +495,8 @@ class DownloadManager(QObject):
             f"downloaded={self.downloaded_size}/{self.total_size} -- {self.traceback_info}",
             exc_info=(exctype, value, tb) if tb else False,
         )
-        self.error_occurred.emit(self.download_id, self.traceback_info)
         self.set_status(Status.ERROR)
+        self.error_occurred.emit(self.download_id, self.traceback_info)
         self.stop_all_workers()
 
     def update_progress(self):
@@ -468,12 +576,36 @@ class DownloadManager(QObject):
         self.traceback_info = ""
         # Bump the epoch so any stragglers from the previous run retire.
         self.worker_epoch += 1
-        if self.status in (Status.STOPPED, Status.COMPLETED):
-            # Start clean: STOPPED discarded partial state; COMPLETED is a
-            # deliberate re-download. ERROR keeps its .progress so it can
-            # resume from where it failed.
+        # Retry may reconstruct a file ADP itself created, but must NOT gain
+        # blanket permission to overwrite a file some other program created at
+        # this path since. Only extend overwrite rights when ADP owns the
+        # destination; otherwise the existing-file guard still applies and the
+        # retry will fail safe until the user explicitly authorizes overwrite.
+        if self.destination_owned_by_adp:
+            self.allow_overwrite = True
+        # A clean restart (discard partial bytes) is needed when: STOPPED
+        # (discarded state), COMPLETED (deliberate re-download), or an ERROR
+        # that's an integrity failure -- checksum/size mismatch means the bytes
+        # on disk are wrong, so resuming would just re-verify the same bad file
+        # forever. A transient (network) ERROR keeps its .progress so it can
+        # resume from where it failed.
+        clean_restart = (self.status in (Status.STOPPED, Status.COMPLETED)
+                         or (self.status == Status.ERROR and self.restart_required))
+        if clean_restart:
             self.downloaded_size = 0
             self.chunk_progress = {}
+            # Synchronously delete the old .progress sidecar. Completion
+            # schedules its cleanup on a background worker, so if the user
+            # clicks Retry immediately the stale (complete) sidecar could
+            # still be on disk when start() calls load_progress() -- making
+            # the download instantly "finish" again instead of re-running.
+            # A tiny JSON delete doesn't need a background worker.
+            try:
+                if os.path.exists(self.progress_file):
+                    os.remove(self.progress_file)
+            except OSError as e:
+                logger.warning(f"Could not remove stale progress file on retry: {e}")
+        self.restart_required = False
         self.set_status(Status.PENDING)
 
     def retry(self):
@@ -485,6 +617,11 @@ class DownloadManager(QObject):
             self.workers.clear()
             self.active_workers = 0
             self.traceback_info = ""
+            # Only extend overwrite rights to a destination ADP created itself
+            # (see prepare_retry). A file another program dropped at this path
+            # must still be protected.
+            if self.destination_owned_by_adp:
+                self.allow_overwrite = True
             if self.status == Status.STOPPED:
                 self.downloaded_size = 0
                 self.chunk_progress = {}

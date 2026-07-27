@@ -35,8 +35,8 @@ class WorkerSignals(QObject):
 
 
 class ChecksumSignals(QObject):
-    finished = pyqtSignal(bool)
-    error = pyqtSignal(str)
+    finished = pyqtSignal(bool, int)  # is_valid, worker_epoch
+    error = pyqtSignal(str, int)      # message, worker_epoch
 
 
 class CleanupWorker(QRunnable):
@@ -54,10 +54,15 @@ class CleanupWorker(QRunnable):
 
 
 class ChecksumWorker(QRunnable):
-    def __init__(self, file_path, expected_checksum):
+    def __init__(self, file_path, expected_checksum, epoch=0):
         super().__init__()
         self.file_path = file_path
         self.expected_checksum = expected_checksum
+        # The manager's worker_epoch when this verification was launched. A
+        # later run (stop -> retry -> verify again) bumps the epoch, so a
+        # straggling result from an earlier run can be recognised and dropped
+        # instead of being accepted as belonging to the current run.
+        self.epoch = epoch
         self.signals = ChecksumSignals()
 
     @pyqtSlot()
@@ -69,9 +74,9 @@ class ChecksumWorker(QRunnable):
                     file_hash.update(chunk)
                 computed_checksum = file_hash.hexdigest()
             is_valid = computed_checksum.lower() == self.expected_checksum.lower()
-            self.signals.finished.emit(is_valid)
+            self.signals.finished.emit(is_valid, self.epoch)
         except OSError as e:
-            self.signals.error.emit(f"File error during checksum: {e}")
+            self.signals.error.emit(f"File error during checksum: {e}", self.epoch)
 
 
 class DownloadWorker(QRunnable):
@@ -150,7 +155,15 @@ class DownloadWorker(QRunnable):
         # the whole download is based on. A different total means the resource
         # changed under us and our chunk offsets no longer line up.
         expected_total = getattr(self.manager, 'total_size', None)
-        if resp_total != '*' and expected_total:
+        if expected_total:
+            if resp_total == '*':
+                # We committed to a total_size (split the file into ranged
+                # chunks against it). A server that now claims an unknown total
+                # can't confirm it's still serving the same-sized resource, so
+                # the bytes can't be trusted for a resumable multi-part write.
+                raise RangeNotHonoredError(
+                    "server returned an unknown total size (bytes .../*) for a range "
+                    "request on a sized download -- can't confirm the resource is unchanged")
             if int(resp_total) != expected_total:
                 raise RangeNotHonoredError(
                     f"server reports a different total size ({resp_total}) than the "

@@ -19,7 +19,7 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
-    QListWidget, QLabel, QListWidgetItem, QSpinBox, QMenu, QComboBox,
+    QListWidget, QLabel, QListWidgetItem, QSpinBox, QMenu, QComboBox, QMessageBox,
 )
 from PyQt6.QtCore import QThreadPool, pyqtSlot, Qt, pyqtSignal
 from PyQt6.QtGui import QAction
@@ -142,6 +142,8 @@ class DownloadPanel(QWidget):
         dialog.url_input.setText(url)
         if dialog.exec():
             data = dialog.get_data()
+            if not self._confirm_overwrite_if_needed(data):
+                return
             self.add_download(**data)
 
     # -- clipboard monitoring --------------------------------------------
@@ -221,9 +223,26 @@ class DownloadPanel(QWidget):
         menu.exec(self.download_list.mapToGlobal(position))
 
     # -- add / start -------------------------------------------------------
+    def _confirm_overwrite_if_needed(self, data) -> bool:
+        """If the chosen save_path already holds a non-resumable file, ask the
+        user before truncating it. Sets data['allow_overwrite'] on a Yes.
+        Returns False if the user cancelled (caller should abort the add)."""
+        save_path = data.get("save_path")
+        if save_path and os.path.exists(save_path) and not os.path.exists(f"{save_path}.progress"):
+            choice = QMessageBox.question(
+                self, "File already exists",
+                f"A file already exists at:\n{save_path}\n\nReplace it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                return False
+            data["allow_overwrite"] = True
+        return True
+
     def add_download(self, url, save_path, checksum=None, num_threads=4, start_immediately=True,
                       headers=None, category=None, speed_limit_bps=0, scheduled_time=None,
-                      verify_tls=None, download_id=None):
+                      verify_tls=None, download_id=None, allow_overwrite=False):
         if not (url and save_path):
             return None, None
 
@@ -252,7 +271,8 @@ class DownloadPanel(QWidget):
             verify_tls = bool(self.settings.get("verify_tls", True))
         manager = DownloadManager(download_id, url, save_path, self.thread_pool, num_threads,
                                    checksum, headers=headers, category=category,
-                                   speed_limit_bps=speed_limit_bps, verify_tls=verify_tls)
+                                   speed_limit_bps=speed_limit_bps, verify_tls=verify_tls,
+                                   allow_overwrite=allow_overwrite)
         self.downloads[download_id] = manager
 
         manager.progress_updated.connect(self.update_download_progress)
@@ -271,6 +291,10 @@ class DownloadPanel(QWidget):
                 self.process_queue()
 
         self.apply_filters()
+        # Persist the session now that the job exists, so a crash before the
+        # next periodic/close save still leaves a record that owns the
+        # .progress sidecar on restart (rather than orphaning it).
+        self.save_downloads()
         return manager, item_widget
 
     def _register_category(self, category):
@@ -286,6 +310,9 @@ class DownloadPanel(QWidget):
             widget.info_label.setText("Status: Pending | Queued from schedule")
         self.download_queue.append(manager)
         self.process_queue()
+        # The job's effective state changed (scheduled -> queued/active);
+        # persist so a crash reflects that it's no longer merely scheduled.
+        self.save_downloads()
 
     def start_scheduled_now(self):
         download_id = self.get_selected_download_id()
@@ -320,6 +347,8 @@ class DownloadPanel(QWidget):
                                     default_dir=default_dir)
         if dialog.exec():
             data = dialog.get_data()
+            if not self._confirm_overwrite_if_needed(data):
+                return
             self.add_download(**data)
 
     @property
@@ -374,6 +403,9 @@ class DownloadPanel(QWidget):
             widget.set_final_status("Completed")
         self.download_completed.emit(download_id, filename)
         self.finish_download_slot(download_id)
+        # Persist the COMPLETED state now, so a crash before the next save
+        # doesn't restore this as still-active.
+        self.save_downloads()
 
     def on_download_error(self, download_id, error_message):
         manager = self.downloads.get(download_id)
@@ -385,6 +417,10 @@ class DownloadPanel(QWidget):
         if widget:
             widget.set_final_status("Error", error_message)
         self.finish_download_slot(download_id)
+        # Persist the ERROR state and its recovery-policy fields (notably
+        # restart_required, set before this signal fired) so a crash doesn't
+        # lose them and let a later retry re-verify a corrupt file.
+        self.save_downloads()
 
     def finish_download_slot(self, download_id):
         if download_id in self.downloads:
@@ -432,11 +468,18 @@ class DownloadPanel(QWidget):
             self.pause_download(download_id)
 
     def pause_download(self, download_id) -> bool:
-        """Pause a download. Panel-level authority, called by GUI and API."""
-        if download_id in self.downloads:
-            self.downloads[download_id].pause()
-            return True
-        return False
+        """Pause a download. Panel-level authority, called by GUI and API.
+        Only an active (downloading/starting/verifying) download can be paused;
+        returns False for anything else so callers (the API) can reject the
+        transition rather than silently no-op."""
+        if download_id not in self.downloads:
+            return False
+        manager = self.downloads[download_id]
+        if manager.status not in (Status.DOWNLOADING, Status.STARTING):
+            return False
+        manager.pause()
+        self.save_downloads()  # persist the PAUSED intent immediately
+        return True
 
     def resume_selected_download(self):
         download_id = self.get_selected_download_id()
@@ -446,10 +489,16 @@ class DownloadPanel(QWidget):
     def resume_download(self, download_id) -> bool:
         """Resume a download under the panel's concurrency policy. The single
         authority for resume, called by both GUI and API so REST/MCP can't
-        bypass the restored-pause queue logic."""
+        bypass the restored-pause queue logic. Only a PAUSED download can be
+        resumed -- a terminal (COMPLETED/STOPPED/ERROR) download must go
+        through retry (which re-checks path reservation), not resume, or an
+        API caller could tunnel a finished job back into active state and
+        bypass the destination-conflict check."""
         if download_id not in self.downloads:
             return False
         manager = self.downloads[download_id]
+        if manager.status != Status.PAUSED:
+            return False
         if not manager.metadata_initialized:
             # Restored-from-session pause: this job never occupied a
             # concurrency slot. Resuming it is really "start it", so route it
@@ -463,6 +512,7 @@ class DownloadPanel(QWidget):
             # Runtime pause -> resume: the slot was counted at start and held
             # across the pause, so just resume in place.
             manager.resume()
+        self.save_downloads()  # persist the resumed intent
         return True
 
     def stop_selected_download(self):
@@ -475,12 +525,14 @@ class DownloadPanel(QWidget):
         if download_id not in self.downloads:
             return False
         manager = self.downloads[download_id]
-        if manager.status in [Status.DOWNLOADING, Status.PAUSED, Status.STARTING]:
+        if manager.status in [Status.DOWNLOADING, Status.PAUSED, Status.STARTING,
+                              Status.VERIFYING]:
             manager.stop()
             self.finish_download_slot(download_id)
             widget = self.find_widget(download_id)
             if widget:
                 widget.set_final_status("Stopped")
+            self.save_downloads()  # persist the STOPPED intent
             return True
         return False
 
@@ -515,6 +567,7 @@ class DownloadPanel(QWidget):
         if manager not in self.download_queue:
             self.download_queue.append(manager)
         self.process_queue()
+        self.save_downloads()  # persist the retry (PENDING + recovery fields)
         return True
 
     def remove_selected_download(self):
@@ -528,14 +581,22 @@ class DownloadPanel(QWidget):
         self.scheduler.unschedule(download_id)
         if download_id in self.downloads:
             manager = self.downloads[download_id]
-            if manager.status in [Status.DOWNLOADING, Status.PAUSED, Status.STARTING]:
+            if manager.status in [Status.DOWNLOADING, Status.PAUSED, Status.STARTING,
+                                   Status.VERIFYING]:
                 manager.stop()
-                self.finish_download_slot(download_id)
+            # Release any slot this download holds, regardless of status --
+            # VERIFYING owns a slot too, and inferring ownership from the enum
+            # is exactly what leaked it. The slot set is the source of truth.
+            self.finish_download_slot(download_id)
             if manager in self.download_queue:
                 self.download_queue.remove(manager)
             del self.downloads[download_id]
 
         self.download_list.takeItem(self.download_list.row(item))
+        # Persist the removal immediately. Otherwise a crash before the next
+        # save would leave the old record on disk and the job would come back
+        # on restart -- the classic "I swear I deleted that" bug.
+        self.save_downloads()
 
     def open_file(self):
         download_id = self.get_selected_download_id()
@@ -589,7 +650,10 @@ class DownloadPanel(QWidget):
                 category=manager.category, speed_limit_bps=manager.speed_limiter.rate,
                 scheduled_time=scheduled.isoformat() if scheduled else None,
                 status=store_status.name, downloaded_size=manager.downloaded_size,
-                total_size=manager.total_size,
+                total_size=manager.total_size, verify_tls=manager.verify_tls,
+                destination_owned_by_adp=manager.destination_owned_by_adp,
+                restart_required=manager.restart_required,
+                allow_overwrite=manager.allow_overwrite,
             ))
         self.session_store.save(records)
 
@@ -610,10 +674,18 @@ class DownloadPanel(QWidget):
                 num_threads=record.num_threads, headers=record.headers, category=record.category,
                 speed_limit_bps=record.speed_limit_bps, scheduled_time=record.scheduled_time,
                 start_immediately=False, download_id=record.download_id,
+                verify_tls=record.verify_tls,
             )
             manager = self.downloads.get(record.download_id)
             if manager is None:
                 continue
+            # Restore the recovery-policy fields so the job's legal operations
+            # after restart match what they were before the crash/close:
+            # whether ADP owns the file, whether a retry must restart from
+            # scratch, and any explicit overwrite authorization.
+            manager.destination_owned_by_adp = record.destination_owned_by_adp
+            manager.restart_required = record.restart_required
+            manager.allow_overwrite = record.allow_overwrite
             try:
                 saved_status = Status[record.status]
             except (KeyError, TypeError):

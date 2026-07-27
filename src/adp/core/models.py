@@ -66,6 +66,24 @@ class DownloadRecord:
     status: str = Status.PENDING.name
     downloaded_size: int = 0
     total_size: int = 0
+    # Per-download TLS verification decision. Persisted so a download the user
+    # explicitly created with verify_tls=False (trusting a specific server)
+    # doesn't silently flip to the global default across a restart, and vice
+    # versa. Defaults True (verify) for records that predate this field.
+    verify_tls: bool = True
+    # Recovery-policy fields: runtime lifecycle decisions that must survive
+    # process death so a restarted job knows the safe, legal operation to
+    # perform when it runs again.
+    #   destination_owned_by_adp -- ADP created/claimed the file, so a retry may
+    #     legitimately reuse/overwrite it (a foreign file stays protected).
+    #   restart_required -- the last failure was an integrity error (checksum/
+    #     size mismatch), so retry must discard the bad bytes and restart.
+    #   allow_overwrite -- an explicit user/API grant to replace a pre-existing
+    #     file, persisted so a scheduled overwrite authorization survives a
+    #     restart before the job runs.
+    destination_owned_by_adp: bool = False
+    restart_required: bool = False
+    allow_overwrite: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> dict:
@@ -82,6 +100,10 @@ class DownloadRecord:
             "status": self.status,
             "downloaded_size": self.downloaded_size,
             "total_size": self.total_size,
+            "verify_tls": self.verify_tls,
+            "destination_owned_by_adp": self.destination_owned_by_adp,
+            "restart_required": self.restart_required,
+            "allow_overwrite": self.allow_overwrite,
             "created_at": self.created_at,
         }
 

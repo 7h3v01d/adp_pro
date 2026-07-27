@@ -183,3 +183,54 @@ def test_api_default_path_fails_closed_when_configured_dir_unavailable(
     with pytest.raises(ApiError):
         call_from_thread(qtbot, controller.add_download,
                          url=mock_server.url_for("viaapi2.bin"))
+
+
+def test_api_add_refuses_existing_destination(qtbot, controller, download_panel, mock_server, tmp_path):
+    """REST/MCP add must return an error (not silently overwrite) when the
+    destination already holds a non-ADP file and overwrite isn't set."""
+    from adp.api.controller import ApiError
+    existing = tmp_path / "existing.bin"
+    existing.write_bytes(b"precious data")
+    mock_server.add_file("existing.bin", b"new" * 100)
+    with pytest.raises(ApiError):
+        call_from_thread(qtbot, controller.add_download,
+                         url=mock_server.url_for("existing.bin"),
+                         save_path=str(existing))
+    # File untouched.
+    assert existing.read_bytes() == b"precious data"
+
+
+def test_api_add_overwrites_with_explicit_flag(qtbot, controller, download_panel, mock_server, tmp_path):
+    """overwrite=true lets the API replace an existing file."""
+    existing = tmp_path / "existing2.bin"
+    existing.write_bytes(b"old")
+    mock_server.add_file("existing2.bin", b"n" * 500)
+    result = call_from_thread(qtbot, controller.add_download,
+                              url=mock_server.url_for("existing2.bin"),
+                              save_path=str(existing), overwrite=True)
+    assert result["save_path"] == str(existing)
+
+
+def test_api_pause_rejects_illegal_transition(qtbot, controller, download_panel, mock_server, download_dir):
+    """Pausing a COMPLETED download must raise, not silently return success."""
+    from adp.api.controller import ApiError
+    from adp.core.models import Status
+    save = os.path.join(download_dir, "pauseillegal.bin")
+    m, _ = download_panel.add_download(mock_server.url_for("pauseillegal.bin") if False else
+                                       "http://192.0.2.1/x.bin", save,
+                                       num_threads=1, start_immediately=False)
+    m.set_status(Status.COMPLETED)
+    with pytest.raises(ApiError):
+        call_from_thread(qtbot, controller.pause_download, m.download_id)
+
+
+def test_api_stop_rejects_illegal_transition(qtbot, controller, download_panel, download_dir):
+    """Stopping an already-COMPLETED download must raise."""
+    from adp.api.controller import ApiError
+    from adp.core.models import Status
+    save = os.path.join(download_dir, "stopillegal.bin")
+    m, _ = download_panel.add_download("http://192.0.2.1/y.bin", save,
+                                       num_threads=1, start_immediately=False)
+    m.set_status(Status.COMPLETED)
+    with pytest.raises(ApiError):
+        call_from_thread(qtbot, controller.stop_download, m.download_id)

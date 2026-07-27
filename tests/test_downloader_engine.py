@@ -469,3 +469,226 @@ def test_speed_limited_worker_cannot_write_after_pause(qapp, thread_pool, mock_s
     # the pause. Since the racy limiter fires on the first chunk, downloaded
     # size should be 0 (nothing committed before the first throttled write).
     assert manager.downloaded_size == 0
+
+
+@pytest.mark.timeout(30)
+def test_existing_destination_is_not_silently_overwritten(qapp, thread_pool, mock_server, download_dir):
+    """A fresh download to a path that already holds a non-ADP file must NOT
+    truncate it -- it fails safe to ERROR instead. RC blocker: open(path,'wb')
+    silently destroyed pre-existing files."""
+    path = "important.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    save_path = os.path.join(download_dir, path)
+    # Pre-existing unrelated file, no .progress sidecar.
+    precious = b"DO NOT DESTROY" * 100
+    with open(save_path, "wb") as f:
+        f.write(precious)
+
+    manager = DownloadManager("dl-precious", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status.is_terminal, timeout=15)
+    assert manager.status == Status.ERROR
+    # The original file must be intact.
+    with open(save_path, "rb") as f:
+        assert f.read() == precious
+
+
+@pytest.mark.timeout(30)
+def test_existing_destination_overwritten_when_allowed(qapp, thread_pool, mock_server, download_dir):
+    """With allow_overwrite=True (retry / explicit API overwrite), the existing
+    file is correctly replaced."""
+    path = "replaceme.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    save_path = os.path.join(download_dir, path)
+    with open(save_path, "wb") as f:
+        f.write(b"old contents")
+
+    manager = DownloadManager("dl-ow", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1, allow_overwrite=True)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status.is_terminal, timeout=15)
+    assert manager.status == Status.COMPLETED
+    with open(save_path, "rb") as f:
+        assert f.read() == FILE_CONTENT
+
+
+@pytest.mark.timeout(30)
+def test_completed_retry_ignores_old_progress_sidecar(qapp, thread_pool, mock_server, download_dir):
+    """Retrying a COMPLETED download must re-download, not instantly re-complete
+    off a stale .progress sidecar. prepare_retry() synchronously deletes it."""
+    path = "recomplete.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    save_path = os.path.join(download_dir, path)
+    manager = DownloadManager("dl-recomplete", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.COMPLETED, timeout=15)
+
+    # Simulate a stale complete sidecar still present (completion cleanup is
+    # async) by writing one, then retry.
+    with open(manager.progress_file, "w") as f:
+        import json as _j
+        _j.dump({"etag": None, "chunk_progress": {"0": len(FILE_CONTENT)},
+                 "total_size": len(FILE_CONTENT)}, f)
+    requests_before = mock_server.request_count(path)
+    manager.prepare_retry()
+    # The sidecar must be gone synchronously.
+    assert not os.path.exists(manager.progress_file)
+    thread_pool_start = manager.start
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.COMPLETED, timeout=15)
+    # It actually re-fetched rather than short-circuiting on the stale sidecar.
+    assert mock_server.request_count(path) > requests_before
+
+
+@pytest.mark.timeout(30)
+def test_late_checksum_result_cannot_resurrect_stopped_job(qapp, thread_pool, mock_server, download_dir):
+    """A checksum worker finishing after the user stopped the download must NOT
+    flip it back to COMPLETED. on_verification_finished only acts if VERIFYING."""
+    path = "verify.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    save_path = os.path.join(download_dir, path)
+    import hashlib
+    checksum = hashlib.sha256(FILE_CONTENT).hexdigest()
+    manager = DownloadManager("dl-verify", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1, checksum=checksum)
+    # Force VERIFYING, then stop, then simulate the late callback.
+    manager.set_status(Status.VERIFYING)
+    manager.stop()
+    assert manager.status == Status.STOPPED
+    # Late checksum result arrives -- must be ignored.
+    manager.on_verification_finished(True)
+    assert manager.status == Status.STOPPED  # not resurrected to COMPLETED
+
+
+@pytest.mark.timeout(30)
+def test_retry_does_not_grant_overwrite_for_foreign_file(qapp, thread_pool, mock_server, download_dir):
+    """The reviewer's scenario: ADP accepts a job for a path that doesn't exist,
+    another program then creates a file there, ADP refuses (ERROR), and the
+    user retries. Retry must NOT silently gain overwrite rights over the
+    foreign file -- destination_owned_by_adp is False, so the guard still bites."""
+    path = "foreign.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    save_path = os.path.join(download_dir, path)
+
+    manager = DownloadManager("dl-foreign", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1)
+    # A foreign program creates the file before ADP claims it.
+    foreign = b"SOMEONE ELSE'S DATA" * 50
+    with open(save_path, "wb") as f:
+        f.write(foreign)
+
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status.is_terminal, timeout=15)
+    assert manager.status == Status.ERROR
+    assert manager.destination_owned_by_adp is False  # ADP never claimed it
+    with open(save_path, "rb") as f:
+        assert f.read() == foreign  # untouched
+
+    # Retry must NOT grant overwrite -- the foreign file is still protected.
+    manager.prepare_retry()
+    assert manager.allow_overwrite is False
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status.is_terminal, timeout=15)
+    assert manager.status == Status.ERROR  # still refused
+    with open(save_path, "rb") as f:
+        assert f.read() == foreign  # STILL untouched
+
+
+@pytest.mark.timeout(30)
+def test_retry_reuses_adp_created_destination(qapp, thread_pool, mock_server, download_dir):
+    """Conversely: if ADP created the file (connection dropped mid-download),
+    retry legitimately reuses it -- destination_owned_by_adp is True."""
+    path = "adp_owned.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    mock_server.fail_path_after(path, 500)  # error after ADP creates the file
+    save_path = os.path.join(download_dir, path)
+
+    manager = DownloadManager("dl-owned", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.ERROR, timeout=15)
+    # ADP preallocated the file before the connection dropped.
+    assert manager.destination_owned_by_adp is True
+
+    mock_server.clear_fault(path)
+    manager.prepare_retry()
+    assert manager.allow_overwrite is True  # allowed: ADP owns this file
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.COMPLETED, timeout=15)
+    with open(save_path, "rb") as f:
+        assert f.read() == FILE_CONTENT
+
+
+@pytest.mark.timeout(30)
+def test_stale_checksum_epoch_rejected_across_retry(qapp, thread_pool, mock_server, download_dir):
+    """A checksum result from a previous run must be rejected even if the
+    download is VERIFYING again (a stop->retry cycle reached VERIFYING). The
+    epoch guard distinguishes the two runs; status alone can't."""
+    import hashlib
+    path = "epochverify.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    save_path = os.path.join(download_dir, path)
+    checksum = hashlib.sha256(FILE_CONTENT).hexdigest()
+    manager = DownloadManager("dl-epoch", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1, checksum=checksum)
+
+    # Run 1 is verifying at the current epoch.
+    manager.set_status(Status.VERIFYING)
+    run1_epoch = manager.worker_epoch
+    # A stop->retry bumps the epoch; now Run 2 is verifying.
+    manager.worker_epoch += 1
+    manager.set_status(Status.VERIFYING)
+
+    # Run 1's stale result arrives with the OLD epoch -- must be ignored, even
+    # though status is VERIFYING again.
+    manager.on_verification_finished(False, run1_epoch)
+    assert manager.status == Status.VERIFYING  # not flipped to ERROR by stale run
+
+    # Run 2's own result (current epoch) is accepted.
+    manager.on_verification_finished(True, manager.worker_epoch)
+    assert manager.status == Status.COMPLETED
+
+
+@pytest.mark.timeout(30)
+def test_checksum_failure_retry_restarts_from_scratch(qapp, thread_pool, mock_server, download_dir):
+    """A checksum mismatch marks restart_required, so retry discards the (bad)
+    partial state instead of re-verifying the same corrupt file forever."""
+    import hashlib
+    path = "badsum.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    save_path = os.path.join(download_dir, path)
+    wrong_checksum = hashlib.sha256(b"not the real content").hexdigest()
+    manager = DownloadManager("dl-badsum", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1, checksum=wrong_checksum)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.ERROR, timeout=15)
+    assert manager.restart_required is True
+    assert manager.downloaded_size > 0  # bytes are on disk (but wrong checksum)
+
+    manager.prepare_retry()
+    # Integrity failure -> clean restart: progress discarded.
+    assert manager.downloaded_size == 0
+    assert manager.chunk_progress == {}
+    assert manager.restart_required is False  # cleared after handling
+
+
+@pytest.mark.timeout(30)
+def test_network_error_retry_preserves_progress(qapp, thread_pool, mock_server, download_dir):
+    """A transient (network) ERROR is NOT restart_required, so retry preserves
+    partial progress and resumes rather than restarting from zero."""
+    path = "netfail.bin"
+    mock_server.add_file(path, FILE_CONTENT)
+    mock_server.fail_path_after(path, 500)
+    save_path = os.path.join(download_dir, path)
+    manager = DownloadManager("dl-netfail", mock_server.url_for(path), save_path,
+                              thread_pool, num_threads=1)
+    manager.start()
+    assert pump_events(qapp, lambda: manager.status == Status.ERROR, timeout=15)
+    assert manager.restart_required is False  # network error, not integrity
+
+    partial = manager.downloaded_size
+    manager.prepare_retry()
+    # Progress preserved for a resumable error (not zeroed).
+    assert manager.downloaded_size == partial

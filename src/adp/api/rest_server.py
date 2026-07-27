@@ -50,6 +50,9 @@ class AddDownloadRequest(BaseModel):
     # None -> use the app-wide setting (which defaults to True). Only set
     # False for a server whose certificate the caller has decided to trust.
     verify_tls: Optional[bool] = None
+    # Replace a pre-existing non-resumable file at save_path. Defaults False so
+    # an unrelated existing file is never silently truncated.
+    overwrite: bool = False
 
 
 class AddTorrentRequest(BaseModel):
@@ -123,7 +126,7 @@ def build_app(controller: AppController, key_store: ApiKeyStore) -> FastAPI:
         return controller.add_download(
             url=body.url, save_path=body.save_path, category=body.category,
             num_threads=body.num_threads, checksum=body.checksum, speed_limit_bps=body.speed_limit_bps,
-            verify_tls=body.verify_tls,
+            verify_tls=body.verify_tls, overwrite=body.overwrite,
         )
 
     @app.get("/downloads/{download_id}")

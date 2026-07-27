@@ -61,17 +61,22 @@ def build_mcp_server(controller: AppController) -> FastMCP:
     @mcp.tool()
     def add_download(url: str, save_path: Optional[str] = None, category: Optional[str] = None,
                       num_threads: int = 4, checksum: Optional[str] = None,
-                      speed_limit_bps: int = 0, verify_tls: Optional[bool] = None) -> dict:
+                      speed_limit_bps: int = 0, verify_tls: Optional[bool] = None,
+                      overwrite: bool = False) -> dict:
         """Adds a new HTTP(S) download. url must be a real link (starting
         with http:// or https://), not a page's visible link text.
         save_path defaults to the app's data directory if omitted.
         speed_limit_bps of 0 means unlimited. verify_tls of None uses the
         app-wide setting (default True: TLS certificates are verified);
         pass False only for a server whose certificate you've decided to
-        trust despite it failing verification."""
+        trust despite it failing verification. overwrite defaults to False:
+        if save_path already holds a file that isn't a resumable ADP download,
+        the request is refused rather than destroying it -- pass overwrite=True
+        only when you intend to replace the existing file."""
         return controller.add_download(
             url=url, save_path=save_path, category=category, num_threads=num_threads,
             checksum=checksum, speed_limit_bps=speed_limit_bps, verify_tls=verify_tls,
+            overwrite=overwrite,
         )
 
     @mcp.tool()

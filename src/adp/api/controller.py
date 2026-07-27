@@ -81,14 +81,15 @@ class AppController:
 
     def add_download(self, url: str, save_path: Optional[str] = None, category: Optional[str] = None,
                       num_threads: int = 4, checksum: Optional[str] = None,
-                      speed_limit_bps: int = 0, verify_tls: Optional[bool] = None) -> dict:
+                      speed_limit_bps: int = 0, verify_tls: Optional[bool] = None,
+                      overwrite: bool = False) -> dict:
         return self.bridge.call(
             self._add_download_impl, url, save_path, category, num_threads, checksum,
-            speed_limit_bps, verify_tls
+            speed_limit_bps, verify_tls, overwrite
         )
 
     def _add_download_impl(self, url, save_path, category, num_threads, checksum,
-                            speed_limit_bps, verify_tls=None) -> dict:
+                            speed_limit_bps, verify_tls=None, overwrite=False) -> dict:
         if not url:
             raise ApiError("url is required")
         if not save_path:
@@ -102,9 +103,19 @@ class AppController:
             except ConfiguredPathUnavailableError as e:
                 raise ApiError(str(e))
             save_path = os.path.join(base_dir, filename)
+        # Fail safe on a pre-existing file that isn't a resumable ADP job: an
+        # AI/MCP caller supplies paths directly, and silently truncating an
+        # unrelated file is unacceptable. Require an explicit overwrite=true.
+        if not overwrite and os.path.exists(save_path):
+            progress_file = f"{save_path}.progress"
+            if not os.path.exists(progress_file):
+                raise ApiError(
+                    f"Destination already exists: {save_path}. Pass overwrite=true to "
+                    "replace it, or choose another path.")
         manager, widget = self.download_panel.add_download(
             url=url, save_path=save_path, category=category, num_threads=num_threads,
             checksum=checksum, speed_limit_bps=speed_limit_bps, verify_tls=verify_tls,
+            allow_overwrite=overwrite,
         )
         if manager is None:
             raise ApiError(
@@ -119,8 +130,12 @@ class AppController:
     def _pause_download_impl(self, download_id: str) -> dict:
         manager = self._require_download(download_id)
         # Route through the panel so the API obeys the same lifecycle policy
-        # as the GUI (the panel owns concurrency/slot accounting).
-        self.download_panel.pause_download(download_id)
+        # as the GUI (the panel owns concurrency/slot accounting). Reject an
+        # illegal transition instead of returning success unchanged, so an
+        # agent can't infer "call succeeded, therefore the download paused".
+        if not self.download_panel.pause_download(download_id):
+            raise ApiError(
+                f"Download is not pausable from status '{manager.status.name}'.")
         return self._serialize_download(manager)
 
     def resume_download(self, download_id: str) -> dict:
@@ -130,7 +145,13 @@ class AppController:
         manager = self._require_download(download_id)
         # Panel-level resume respects the restored-pause queue logic and slot
         # accounting instead of bypassing it with a direct manager.resume().
-        self.download_panel.resume_download(download_id)
+        # It only accepts a PAUSED download; a terminal one must be retried
+        # (which re-checks path reservation), not resumed.
+        accepted = self.download_panel.resume_download(download_id)
+        if not accepted:
+            raise ApiError(
+                f"Download is not resumable from status '{manager.status.name}'. "
+                "Only a paused download can be resumed; use retry for a finished one.")
         return self._serialize_download(manager)
 
     def stop_download(self, download_id: str) -> dict:
@@ -138,7 +159,9 @@ class AppController:
 
     def _stop_download_impl(self, download_id: str) -> dict:
         manager = self._require_download(download_id)
-        self.download_panel.stop_download(download_id)
+        if not self.download_panel.stop_download(download_id):
+            raise ApiError(
+                f"Download is not stoppable from status '{manager.status.name}'.")
         return self._serialize_download(manager)
 
     def retry_download(self, download_id: str) -> dict:

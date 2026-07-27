@@ -186,3 +186,33 @@ def test_stats_endpoint_without_stats_panel(qtbot, client, key_store):
     response = request_from_thread(qtbot, lambda: client.get("/stats", headers=auth_headers(key_store)))
     assert response.status_code == 200
     assert response.json() == {}
+
+
+def test_rest_add_refuses_existing_file_without_overwrite(qtbot, client, key_store, mock_server, download_dir):
+    """The overwrite contract flows end-to-end through the HTTP layer: POST
+    /downloads to an existing path without overwrite is refused."""
+    existing = os.path.join(download_dir, "rest_existing.bin")
+    with open(existing, "wb") as f:
+        f.write(b"precious")
+    mock_server.add_file("rest_existing.bin", b"new" * 100)
+    resp = request_from_thread(qtbot, lambda: client.post(
+        "/downloads",
+        json={"url": mock_server.url_for("rest_existing.bin"), "save_path": existing},
+        headers=auth_headers(key_store),
+    ))
+    assert resp.status_code >= 400  # refused
+    with open(existing, "rb") as f:
+        assert f.read() == b"precious"  # untouched
+
+
+def test_rest_add_overwrite_true_accepts(qtbot, client, key_store, mock_server, download_dir):
+    existing = os.path.join(download_dir, "rest_ow.bin")
+    with open(existing, "wb") as f:
+        f.write(b"old")
+    mock_server.add_file("rest_ow.bin", os.urandom(2000))
+    resp = request_from_thread(qtbot, lambda: client.post(
+        "/downloads",
+        json={"url": mock_server.url_for("rest_ow.bin"), "save_path": existing, "overwrite": True},
+        headers=auth_headers(key_store),
+    ))
+    assert resp.status_code == 200

@@ -11,8 +11,12 @@ headless-testable core engine.
 **Core download engine**
 - Concurrent, chunked downloads (configurable connection count per file)
 - Resume after a crash or restart: active *and* paused downloads are persisted
-  and picked back up (progress is stored in a `.progress` sidecar and verified
-  against the server's ETag before being trusted)
+  and picked back up. The session record is written the moment a download is
+  added, and the per-download `.progress` sidecar is created as soon as the
+  file is preallocated and updated atomically (temp-file + `os.replace`), so a
+  crash leaves a consistent record + sidecar pair to resume from rather than an
+  orphaned file. Progress is verified against the server's ETag before being
+  trusted.
 - SHA-256 checksum verification
 - Automatic single-thread fallback when a server doesn't support byte ranges
 - Range integrity: ranged responses are strictly validated (206 + matching
@@ -214,6 +218,18 @@ Endpoints: `GET/POST /downloads`, `GET/POST/DELETE /downloads/{id}` plus
 (swap `/stop`+`/retry` for `/force_recheck`+`/select_files`); and
 `GET /stats`. Interactive docs (Swagger UI) are at `/docs` once the app is
 running.
+
+Two safety contracts worth knowing when driving the API programmatically
+(e.g. from an AI/MCP client that supplies paths directly):
+
+- **Overwrite is opt-in.** `POST /downloads` refuses a `save_path` that
+  already holds a file which isn't a resumable ADP download, rather than
+  truncating it. Pass `"overwrite": true` to replace it deliberately.
+- **Resume only resumes a paused download.** `/resume` acts only on a PAUSED
+  job; a finished one (completed/stopped/errored) must be restarted with
+  `/retry`, which re-checks that no other download has claimed its
+  destination. This keeps a finished download from being tunnelled back into
+  active state behind the destination-reservation rules.
 
 ### MCP
 
