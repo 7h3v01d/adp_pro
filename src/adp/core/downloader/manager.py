@@ -262,6 +262,16 @@ class DownloadManager(QObject):
                     "download. Refusing to overwrite it. Choose another name, remove the "
                     "existing file, or allow overwrite.")
                 return
+            if os.path.exists(self.save_path) and self.destination_owned_by_adp:
+                # ADP owns this file but its .progress sidecar is missing or no
+                # longer matches (lost/corrupted in a crash, or the remote
+                # resource changed). We can't trust the partial bytes, so we
+                # restart from zero rather than resuming against unknown state.
+                # Log it plainly -- this is a deliberate, safe re-download, not
+                # a silent truncation of the user's data.
+                logger.info(
+                    f"[{self.download_id}] No usable progress for our own file at "
+                    f"{self.save_path}; restarting the download from the beginning.")
             self.downloaded_size = 0
             self.chunk_progress = {}
             try:

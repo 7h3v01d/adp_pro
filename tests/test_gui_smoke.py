@@ -736,3 +736,41 @@ def test_adp_ownership_survives_restart(qtbot, tmp_path, mock_server, download_d
     restored = p2.downloads[rid]
     # Ownership survived, so retry is allowed to reclaim ADP's own file.
     assert restored.destination_owned_by_adp is True
+
+
+def test_session_downloaded_size_not_trusted_over_sidecar(qtbot, tmp_path, mock_server,
+                                                          download_dir, thread_pool):
+    """The .progress sidecar is the single source of truth for on-disk bytes.
+    Even if the session record carries a (stale) downloaded_size, a resumed
+    job derives its real progress from the sidecar, and the persisted record
+    for a recoverable job should not carry a competing byte figure."""
+    import json as _json
+    content = os.urandom(1_500_000)
+    mock_server.add_file("srctruth.bin", content)
+    mock_server.set_throttle("srctruth.bin", 500_000)
+    save = os.path.join(download_dir, "srctruth.bin")
+
+    p1 = _restart_panel(qtbot, tmp_path, thread_pool)
+    m, _ = p1.add_download(mock_server.url_for("srctruth.bin"), save, num_threads=1)
+    assert _poll_until(qtbot, lambda: m.status == Status.DOWNLOADING and m.downloaded_size > 0)
+    p1.pause_download(m.download_id)
+    assert _poll_until(qtbot, lambda: m.status == Status.PAUSED)
+
+    # The persisted record for this recoverable job must NOT carry a byte
+    # figure -- the sidecar owns that truth.
+    stored = p1.session_store.load()
+    rec = next(r for r in stored if r.download_id == m.download_id)
+    assert rec.downloaded_size == 0
+
+    # Restart and resume: it derives progress from the sidecar and completes.
+    mock_server.set_throttle("srctruth.bin", 0)
+    p2 = _restart_panel(qtbot, tmp_path, thread_pool)
+    rid = p2.download_list.item(0).data(Qt.ItemDataRole.UserRole)
+    restored = p2.downloads[rid]
+    assert restored.status == Status.PAUSED
+    p2.download_list.setCurrentRow(0)
+    p2.resume_download(rid)
+    assert _poll_until(qtbot, lambda: restored.status.is_terminal, timeout_s=20)
+    assert restored.status == Status.COMPLETED
+    with open(save, "rb") as f:
+        assert f.read() == content

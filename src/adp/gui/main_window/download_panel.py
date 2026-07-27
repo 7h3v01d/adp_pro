@@ -644,12 +644,22 @@ class DownloadPanel(QWidget):
             # actually come back on restart -- the whole point of the feature.
             store_status = self._RESTORE_STATUS_MAP.get(manager.status, manager.status)
             scheduled = self.scheduler.scheduled_time(manager.download_id)
+            # The .progress sidecar is the single source of truth for how many
+            # bytes are actually on disk for a resumable job. Persisting a
+            # second, save-time snapshot of downloaded_size in the session row
+            # invites the two to disagree after a mid-download crash. So only
+            # record a byte figure for states that have NO sidecar to recompute
+            # from (COMPLETED/ERROR, restored for display); for recoverable
+            # jobs store 0 and let load_progress() derive the real figure from
+            # the sidecar on resume.
+            has_own_byte_truth = store_status in (Status.COMPLETED, Status.ERROR)
+            persisted_downloaded = manager.downloaded_size if has_own_byte_truth else 0
             records.append(DownloadRecord(
                 download_id=manager.download_id, url=manager.url, save_path=manager.save_path,
                 checksum=manager.checksum, num_threads=manager.num_threads, headers=manager.headers,
                 category=manager.category, speed_limit_bps=manager.speed_limiter.rate,
                 scheduled_time=scheduled.isoformat() if scheduled else None,
-                status=store_status.name, downloaded_size=manager.downloaded_size,
+                status=store_status.name, downloaded_size=persisted_downloaded,
                 total_size=manager.total_size, verify_tls=manager.verify_tls,
                 destination_owned_by_adp=manager.destination_owned_by_adp,
                 restart_required=manager.restart_required,
