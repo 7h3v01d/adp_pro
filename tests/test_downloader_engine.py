@@ -525,6 +525,12 @@ def test_completed_retry_ignores_old_progress_sidecar(qapp, thread_pool, mock_se
     manager.start()
     assert pump_events(qapp, lambda: manager.status == Status.COMPLETED, timeout=15)
 
+    # The real cleanup runs asynchronously on the thread pool (see
+    # CleanupWorker in manager.py). Wait for it to actually finish before
+    # writing our own stale sidecar below -- otherwise this write can race
+    # the real os.remove() and hit a Windows delete-pending PermissionError.
+    thread_pool.waitForDone(5000)
+
     # Simulate a stale complete sidecar still present (completion cleanup is
     # async) by writing one, then retry.
     with open(manager.progress_file, "w") as f:

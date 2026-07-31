@@ -4,7 +4,7 @@ requests>=2.31
 urllib3>=2.0
 fastapi>=0.115
 uvicorn>=0.30
-mcp>=1.2
+mcp>=1.2,<2.0
 
 # Torrent support is optional and native (no wheels on some platforms).
 # Install it with the app:  pip install -e ".[torrents]"

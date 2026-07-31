@@ -28,7 +28,7 @@ dependencies = [
     "urllib3>=2.0",
     "fastapi>=0.115",
     "uvicorn>=0.30",
-    "mcp>=1.2",
+    "mcp>=1.2,<2.0",
 ]
 
 [project.optional-dependencies]
