@@ -27,6 +27,7 @@ STATE_COLORS = {
     TorrentState.ERROR: STATUS["error"],
     TorrentState.STOPPED: STATUS["warning"],
     TorrentState.PAUSED: STATUS["idle"],
+    TorrentState.QUEUED: STATUS["idle"],
 }
 
 
@@ -123,7 +124,11 @@ class TorrentItemWidget(QWidget):
             # inheriting stale state from before a recheck.
             self._smoothed_rate = 0.0
             self._zero_rate_polls = 0
-            if state == TorrentState.CHECKING:
+            if status.get("queued"):
+                self.info_label.setText(
+                    f"{state_text} \u2013 waiting for a free download slot | "
+                    f"{format_size(downloaded)} / {format_size(total)}")
+            elif state == TorrentState.CHECKING:
                 # During a recheck libtorrent reports progress as 0 until the
                 # check completes; say "Checking..." rather than showing a
                 # 0-byte figure that looks like data was lost.

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QPushButton, QHBoxLayout, QLabel,
     QFileDialog, QDialogButtonBox, QSpinBox, QComboBox, QCheckBox, QDateTimeEdit,
-    QApplication,
+    QApplication, QTabWidget, QWidget, QVBoxLayout,
 )
 from PyQt6.QtCore import QDateTime
 
@@ -207,12 +207,13 @@ class AddDownloadDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """Global app preferences: theme, default speed limit, tray behavior."""
+    """Global app preferences, in three tabs: General (look and app
+    behaviour), Downloads (HTTP downloads) and Torrents."""
 
     def __init__(self, parent=None, current_settings=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(480)
         settings = current_settings or {}
         # Keep a deep copy of everything we were given. get_settings() merges
         # the dialog's known keys over this, so keys the dialog doesn't expose
@@ -220,8 +221,6 @@ class SettingsDialog(QDialog):
         # api_port, and any future setting -- survive a Settings round-trip
         # instead of being silently dropped and wiped on save.
         self._original_settings = copy.deepcopy(dict(settings))
-
-        layout = QFormLayout(self)
 
         self.theme_input = QComboBox()
         # Values are the stored keys; labels describe the look.
@@ -278,8 +277,11 @@ class SettingsDialog(QDialog):
         torrent_dir_row.addWidget(self.torrent_dir_input)
         torrent_dir_row.addWidget(torrent_dir_browse)
 
-        self.free_space_label = QLabel()
-        self.free_space_label.setWordWrap(True)
+        # One free-space readout per folder, shown on that folder's tab.
+        self.download_free_space_label = QLabel()
+        self.download_free_space_label.setObjectName("hint")
+        self.torrent_free_space_label = QLabel()
+        self.torrent_free_space_label.setObjectName("hint")
         self.download_dir_input.textChanged.connect(self._update_free_space_label)
         self.torrent_dir_input.textChanged.connect(self._update_free_space_label)
 
@@ -301,25 +303,101 @@ class SettingsDialog(QDialog):
         if default_ratio:
             self.torrent_seed_ratio_input.setText(str(default_ratio))
 
-        layout.addRow("Theme:", self.theme_input)
-        layout.addRow("Default speed limit:", self.default_speed_limit_input)
-        layout.addRow("Download folder:", download_dir_row)
-        layout.addRow("Torrent folder:", torrent_dir_row)
-        layout.addRow(self.free_space_label)
-        layout.addRow(self.minimize_to_tray_checkbox)
-        layout.addRow(self.notifications_checkbox)
-        layout.addRow(self.clipboard_monitor_checkbox)
-        layout.addRow(self.verify_tls_checkbox)
-        layout.addRow("Torrent listen port:", self.torrent_listen_port_input)
-        layout.addRow(self.torrent_dht_checkbox)
-        layout.addRow("Default seed ratio limit:", self.torrent_seed_ratio_input)
+        # -- move on complete -------------------------------------------------
+        self.torrent_move_checkbox = QCheckBox("Move completed torrents to another folder")
+        self.torrent_move_checkbox.setChecked(settings.get("torrent_move_completed", False))
+        self.torrent_move_checkbox.setToolTip(
+            "When a download finishes, its files are moved here (e.g. from a scratch "
+            "drive into your library). Existing files are never overwritten, and a move "
+            "that won't fit is skipped with the files left in place. Torrents that were "
+            "already complete are not moved."
+        )
+        self.torrent_move_dir_input = QLineEdit()
+        self.torrent_move_dir_input.setPlaceholderText("Folder to move completed torrents into")
+        self.torrent_move_dir_input.setText(settings.get("torrent_move_completed_dir", ""))
+        self.torrent_move_dir_browse = QPushButton("Browse...")
+        self.torrent_move_dir_browse.setObjectName("secondary")
+        self.torrent_move_dir_browse.clicked.connect(lambda: self._browse_dir(self.torrent_move_dir_input))
+        move_dir_row = QHBoxLayout()
+        move_dir_row.addWidget(self.torrent_move_dir_input)
+        move_dir_row.addWidget(self.torrent_move_dir_browse)
+        self.torrent_move_by_category_checkbox = QCheckBox("Put each category in its own subfolder")
+        self.torrent_move_by_category_checkbox.setChecked(
+            settings.get("torrent_move_completed_by_category", False))
+        self.torrent_move_free_space_label = QLabel()
+        self.torrent_move_free_space_label.setObjectName("hint")
+        self.torrent_move_checkbox.toggled.connect(self._update_move_controls)
+        self.torrent_move_dir_input.textChanged.connect(self._update_free_space_label)
+
+        self.torrent_max_active_input = QSpinBox()
+        self.torrent_max_active_input.setRange(0, 100)
+        self.torrent_max_active_input.setSpecialValueText("Unlimited")  # shown for 0
+        self.torrent_max_active_input.setValue(settings.get("torrent_max_active_downloads", 3))
+        self.torrent_max_active_input.setToolTip(
+            "How many torrents download at the same time. Others wait as 'Queued' "
+            "and start automatically when a slot frees up. Stalled torrents don't "
+            "take a slot. Right-click a queued torrent and choose Start Now to skip "
+            "the queue. Applies immediately."
+        )
+
+        self.torrent_stop_on_complete_checkbox = QCheckBox(
+            "Stop torrents when download completes (don't seed)")
+        self.torrent_stop_on_complete_checkbox.setChecked(
+            settings.get("torrent_stop_on_complete", True))
+        self.torrent_stop_on_complete_checkbox.setToolTip(
+            "When a torrent reaches 100%, stop it instead of seeding forever. "
+            "Resuming a completed torrent by hand still lets it seed. Takes "
+            "effect immediately, including for torrents already seeding."
+        )
+
+        # -- General ---------------------------------------------------------
+        general = QFormLayout()
+        general.addRow("Theme:", self.theme_input)
+        general.addRow(self.minimize_to_tray_checkbox)
+        general.addRow(self.notifications_checkbox)
+        general.addRow(self.clipboard_monitor_checkbox)
+
+        # -- Downloads (HTTP) ------------------------------------------------
+        downloads = QFormLayout()
+        downloads.addRow("Download folder:", download_dir_row)
+        downloads.addRow("", self.download_free_space_label)
+        downloads.addRow("Default speed limit:", self.default_speed_limit_input)
+        downloads.addRow(self.verify_tls_checkbox)
+
+        # -- Torrents --------------------------------------------------------
+        torrents = QFormLayout()
+        torrents.addRow("Torrent folder:", torrent_dir_row)
+        torrents.addRow("", self.torrent_free_space_label)
+        torrents.addRow("Max active downloads:", self.torrent_max_active_input)
+        torrents.addRow(self.torrent_stop_on_complete_checkbox)
+        torrents.addRow(self.torrent_move_checkbox)
+        torrents.addRow("Move to:", move_dir_row)
+        torrents.addRow("", self.torrent_move_free_space_label)
+        torrents.addRow("", self.torrent_move_by_category_checkbox)
+        torrents.addRow("Default seed ratio limit:", self.torrent_seed_ratio_input)
+        torrents.addRow("Listen port:", self.torrent_listen_port_input)
+        torrents.addRow(self.torrent_dht_checkbox)
+        restart_note = QLabel("Listen port and DHT changes apply after restarting ADP.")
+        restart_note.setObjectName("hint")
+        restart_note.setWordWrap(True)
+        torrents.addRow(restart_note)
+
+        self.tabs = QTabWidget()
+        for title, form in (("General", general), ("Downloads", downloads), ("Torrents", torrents)):
+            page = QWidget()
+            page.setLayout(form)
+            self.tabs.addTab(page, title)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tabs)
+        layout.addWidget(buttons)
 
         self._update_free_space_label()
+        self._update_move_controls()
 
     def _browse_dir(self, target_input: QLineEdit):
         start = target_input.text().strip() or os.path.expanduser("~")
@@ -327,17 +405,28 @@ class SettingsDialog(QDialog):
         if chosen:
             target_input.setText(chosen)
 
+    def _update_move_controls(self):
+        enabled = self.torrent_move_checkbox.isChecked()
+        for w in (self.torrent_move_dir_input, self.torrent_move_dir_browse,
+                  self.torrent_move_by_category_checkbox, self.torrent_move_free_space_label):
+            w.setEnabled(enabled)
+
     def _update_free_space_label(self):
-        parts = []
-        for label, widget in (("Download", self.download_dir_input),
-                               ("Torrent", self.torrent_dir_input)):
+        for widget, label in ((self.download_dir_input, self.download_free_space_label),
+                              (self.torrent_dir_input, self.torrent_free_space_label)):
             path = widget.text().strip()
             if not path:
+                label.setText("Using the app-data folder.")
                 continue
             free = free_space_bytes(path)
-            parts.append(f"{label}: {format_size(free)} free" if free is not None
-                         else f"{label}: free space unknown")
-        self.free_space_label.setText("   ".join(parts))
+            label.setText(f"{format_size(free)} free" if free is not None else "Free space unknown")
+        move_path = self.torrent_move_dir_input.text().strip()
+        if not move_path:
+            self.torrent_move_free_space_label.setText("Choose a folder to enable moving.")
+        else:
+            free = free_space_bytes(move_path)
+            self.torrent_move_free_space_label.setText(
+                f"{format_size(free)} free" if free is not None else "Free space unknown")
 
     def get_settings(self) -> dict:
         try:
@@ -365,6 +454,11 @@ class SettingsDialog(QDialog):
             "torrent_listen_port": self.torrent_listen_port_input.value(),
             "torrent_enable_dht": self.torrent_dht_checkbox.isChecked(),
             "torrent_default_seed_ratio_limit": torrent_seed_ratio,
+            "torrent_stop_on_complete": self.torrent_stop_on_complete_checkbox.isChecked(),
+            "torrent_max_active_downloads": self.torrent_max_active_input.value(),
+            "torrent_move_completed": self.torrent_move_checkbox.isChecked(),
+            "torrent_move_completed_dir": self.torrent_move_dir_input.text().strip(),
+            "torrent_move_completed_by_category": self.torrent_move_by_category_checkbox.isChecked(),
         })
         return merged
 

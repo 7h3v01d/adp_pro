@@ -100,6 +100,10 @@ class TorrentRecord:
     upload_limit_bps: int = 0
     download_limit_bps: int = 0
     seed_ratio_limit: float = 0.0  # 0 == unlimited (seed forever / until user stops)
+    # Set when the user explicitly resumes a torrent after it completed:
+    # "stop on complete" then leaves it alone (also across restarts) so a
+    # deliberate choice to seed is never overridden by the global setting.
+    keep_seeding: bool = False
     added_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> dict:
@@ -114,6 +118,7 @@ class TorrentRecord:
             "upload_limit_bps": self.upload_limit_bps,
             "download_limit_bps": self.download_limit_bps,
             "seed_ratio_limit": self.seed_ratio_limit,
+            "keep_seeding": self.keep_seeding,
             "added_at": self.added_at,
         }
 

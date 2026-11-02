@@ -67,10 +67,18 @@ class TorrentEngine(QObject):
     torrent_finished = pyqtSignal(str, str)  # torrent_id, name
     torrent_error = pyqtSignal(str, str)  # torrent_id, message
     resume_data_saved = pyqtSignal(str, bytes)  # torrent_id, resume_data_bytes
+    # Fired on libtorrent's state_changed_alert into downloading_metadata /
+    # downloading. Alert-driven (not polled), so even a torrent that starts
+    # and finishes between two polls is reported -- in order, before its
+    # torrent_finished.
+    download_started = pyqtSignal(str)  # torrent_id
+    storage_moved = pyqtSignal(str, str)  # torrent_id, new save path
+    storage_move_failed = pyqtSignal(str, str)  # torrent_id, error message
 
     def __init__(self, listen_port: int = 6881, enable_dht: bool = True,
                  bind_address: str = "0.0.0.0", enable_lsd: bool = True,
                  enable_upnp: bool = True, enable_natpmp: bool = True,
+                 max_active_downloads: int = 3,
                  extra_settings: Optional[dict] = None, parent=None):
         super().__init__(parent)
         settings = {
@@ -79,6 +87,14 @@ class TorrentEngine(QObject):
             "enable_lsd": enable_lsd,
             "enable_upnp": enable_upnp,
             "enable_natpmp": enable_natpmp,
+            # Queueing: at most N torrents download at once; the rest wait
+            # as QUEUED and start automatically as slots free up. Stalled
+            # torrents (libtorrent's dont_count_slow_torrents, on by default)
+            # don't hold a slot. Seeding is never queued: a torrent only
+            # seeds when the user chose to (stop-on-complete off, or Keep
+            # Seeding), so a hidden seed cap would silently override that.
+            "active_downloads": self._limit_value(max_active_downloads),
+            "active_seeds": -1,
             "alert_mask": (
                 lt.alert.category_t.status_notification
                 | lt.alert.category_t.error_notification
@@ -102,6 +118,79 @@ class TorrentEngine(QObject):
 
     def stop(self):
         self._timer.stop()
+
+    @staticmethod
+    def _limit_value(n: int) -> int:
+        """Our convention is 0 = unlimited; libtorrent's is -1."""
+        return int(n) if n and int(n) > 0 else -1
+
+    def set_max_active_downloads(self, n: int):
+        """How many torrents may download at once (0 = no limit). Applies
+        live: raising it starts queued torrents, lowering it queues the
+        excess (most recently queued first)."""
+        self.session.apply_settings({"active_downloads": self._limit_value(n)})
+
+    def move_storage(self, torrent_id: str, destination: str) -> bool:
+        """Asks libtorrent to move the torrent's files into `destination`
+        (a folder; the torrent keeps its own name/sub-folder inside it).
+        Runs on libtorrent's disk thread -- a rename on the same drive, a
+        copy-then-delete across drives -- and reports via storage_moved /
+        storage_move_failed. fail_if_exist: never overwrite files already at
+        the destination; that fails the move and leaves everything where it
+        was. Works on paused torrents too."""
+        handle = self.handles.get(torrent_id)
+        if handle is None or not handle.is_valid():
+            return False
+        handle.move_storage(destination, lt.move_flags_t.fail_if_exist)
+        return True
+
+    def start_now(self, torrent_id: str):
+        """Starts a queued torrent immediately, bypassing the download limit
+        ("force start"): it leaves auto-management, so the queue neither
+        holds it back nor pauses it later. Pause/Resume hands it back."""
+        handle = self.handles.get(torrent_id)
+        if handle is not None:
+            handle.unset_flags(lt.torrent_flags.auto_managed)
+            handle.resume()
+
+    @staticmethod
+    def is_queued(status) -> bool:
+        """Waiting for a download slot: paused by libtorrent's auto-manager
+        (still auto-managed), not by the user (whose pause clears the flag)
+        and not because it's complete."""
+        return bool(status.paused and not status.is_finished
+                    and status.flags & lt.torrent_flags.auto_managed)
+
+    @staticmethod
+    def state_from_status(status) -> TorrentState:
+        """The one place a libtorrent status becomes our display state --
+        shared by the GUI rows and the REST/MCP serializer."""
+        state = LT_STATE_TO_TORRENT_STATE.get(int(status.state), TorrentState.DOWNLOADING)
+        if status.paused:
+            if status.is_finished:
+                # Stopped with everything it wants (e.g. by 'stop on
+                # complete'): "Finished", not an interrupted "Paused".
+                state = TorrentState.FINISHED
+            elif status.flags & lt.torrent_flags.auto_managed:
+                state = TorrentState.QUEUED  # waiting for a download slot
+            else:
+                state = TorrentState.PAUSED  # the user paused it
+        return state
+
+    def shutdown(self):
+        """Stops polling and destroys the libtorrent session *now*.
+
+        libtorrent's session destructor blocks while it says goodbye to the
+        network (tracker 'stopped' announces, UPnP/NAT-PMP port unmapping
+        with the router, LSD). Left to Python, the session is only freed
+        whenever the cyclic GC gets round to this engine -- at an arbitrary
+        later moment on the GUI thread, freezing whatever is running then.
+        Calling this pins that cost to a moment of our choosing. The engine
+        is unusable afterwards."""
+        self._timer.stop()
+        self.handles.clear()
+        session, self.session = self.session, None
+        del session  # last reference: the destructor runs here
 
     # -- adding ------------------------------------------------------------
     def add_torrent_file(self, torrent_path: str, save_path: str,
@@ -348,6 +437,22 @@ class TorrentEngine(QObject):
             logger.error("[%s] Torrent error: %s", torrent_id, message)
             self.torrent_error.emit(torrent_id, message)
 
+        elif alert_type == "state_changed_alert":
+            if int(alert.state) in (2, 3):  # downloading_metadata, downloading
+                self.download_started.emit(_info_hash_str(alert.handle))
+
+        elif alert_type == "storage_moved_alert":
+            torrent_id = _info_hash_str(alert.handle)
+            new_path = alert.storage_path()
+            logger.info("[%s] Storage moved to %s", torrent_id, new_path)
+            self.storage_moved.emit(torrent_id, new_path)
+
+        elif alert_type == "storage_moved_failed_alert":
+            torrent_id = _info_hash_str(alert.handle)
+            message = alert.message()
+            logger.error("[%s] Storage move failed: %s", torrent_id, message)
+            self.storage_move_failed.emit(torrent_id, message)
+
         elif alert_type == "save_resume_data_alert":
             handle = alert.handle
             torrent_id = _info_hash_str(handle)
@@ -365,9 +470,7 @@ class TorrentEngine(QObject):
 
     @staticmethod
     def _status_dict(status) -> dict:
-        state = LT_STATE_TO_TORRENT_STATE.get(int(status.state), TorrentState.DOWNLOADING)
-        if status.paused and state not in (TorrentState.FINISHED,):
-            state = TorrentState.PAUSED
+        state = TorrentEngine.state_from_status(status)
         ratio = (status.all_time_upload / status.all_time_download) if status.all_time_download > 0 else 0.0
         return {
             "name": status.name,
@@ -386,5 +489,6 @@ class TorrentEngine(QObject):
             "is_seeding": status.is_seeding,
             "is_finished": status.is_finished,
             "has_metadata": status.has_metadata,
+            "queued": TorrentEngine.is_queued(status),
             "error": status.error,
         }

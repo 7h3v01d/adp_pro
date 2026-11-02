@@ -81,6 +81,31 @@ def free_space_bytes(path: str) -> Optional[int]:
     return None
 
 
+def _existing_ancestor(path: str) -> Optional[str]:
+    probe = os.path.abspath(path or ".")
+    for _ in range(64):
+        if os.path.exists(probe):
+            return probe
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    return None
+
+
+def same_volume(a: str, b: str) -> Optional[bool]:
+    """True if both paths (or their nearest existing ancestors) live on the
+    same volume -- a move between them is then a cheap rename that needs no
+    extra space. None when it can't be determined."""
+    pa, pb = _existing_ancestor(a), _existing_ancestor(b)
+    if not pa or not pb:
+        return None
+    try:
+        return os.stat(pa).st_dev == os.stat(pb).st_dev
+    except OSError:
+        return None
+
+
 @dataclass(frozen=True)
 class SpaceCheck:
     fits: bool

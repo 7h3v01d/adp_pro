@@ -5,7 +5,7 @@ import os
 from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QLabel, QFileDialog, QDialogButtonBox, QComboBox, QListWidget,
-    QListWidgetItem, QRadioButton, QButtonGroup, QWidget,
+    QListWidgetItem, QRadioButton, QButtonGroup, QWidget, QCheckBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -288,3 +288,110 @@ class SelectFilesDialog(QDialog):
 
     def get_priorities(self) -> dict:
         return self.file_selection.get_priorities()
+
+
+def _format_limit(bps: int) -> str:
+    """Bytes/sec -> the text the limit fields accept ('2 MB'), blank = none."""
+    return format_size(bps).replace(".00", "") if bps else ""
+
+
+class TorrentPropertiesDialog(QDialog):
+    """Edit an already-added torrent's settings: category, speed limits,
+    seed ratio limit, and whether it keeps seeding after completion. The
+    same fields (and validation) as Add Torrent, so a torrent never has to
+    be removed and re-added just to change them."""
+
+    def __init__(self, parent=None, record=None, categories=None):
+        super().__init__(parent)
+        self.setWindowTitle("Torrent Properties")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+
+        # -- read-only identity ----------------------------------------------
+        # One form for both halves so every field lines up in one column.
+        form = QFormLayout()
+        for label, value in (("Name:", record.name), ("Saved to:", record.save_path),
+                             ("Info hash:", record.torrent_id)):
+            field = QLineEdit(value or "")
+            field.setReadOnly(True)
+            field.setFocusPolicy(Qt.FocusPolicy.ClickFocus)  # don't open focused on a read-only field
+            field.setCursorPosition(0)
+            form.addRow(label, field)
+
+        # -- editable settings -----------------------------------------------
+        self.category_input = QComboBox()
+        self.category_input.setEditable(True)  # custom categories allowed
+        names = list(ALL_CATEGORIES)
+        for extra in list(categories or []) + [record.category]:
+            if extra and extra not in names:
+                names.append(extra)
+        self.category_input.addItems(names)
+        self.category_input.setCurrentText(record.category)
+        form.addRow("Category:", self.category_input)
+        self.category_input.setFocus()
+
+        self.download_limit_input = QLineEdit(_format_limit(record.download_limit_bps))
+        self.download_limit_input.setPlaceholderText("e.g. 2 MB (blank = unlimited)")
+        self.upload_limit_input = QLineEdit(_format_limit(record.upload_limit_bps))
+        self.upload_limit_input.setPlaceholderText("e.g. 500 KB (blank = unlimited)")
+        form.addRow("Download Limit:", self.download_limit_input)
+        form.addRow("Upload Limit:", self.upload_limit_input)
+
+        self.seed_ratio_input = QLineEdit(
+            f"{record.seed_ratio_limit:g}" if record.seed_ratio_limit else "")
+        self.seed_ratio_input.setPlaceholderText("e.g. 2.0 (blank = no limit)")
+        form.addRow("Seed Ratio Limit:", self.seed_ratio_input)
+
+        self.keep_seeding_checkbox = QCheckBox("Keep seeding after the download completes")
+        self.keep_seeding_checkbox.setChecked(record.keep_seeding)
+        self.keep_seeding_checkbox.setToolTip(
+            "Overrides 'Stop torrents when download completes' for this torrent. "
+            "The seed ratio limit (if set) still applies."
+        )
+        form.addRow(self.keep_seeding_checkbox)
+        layout.addLayout(form)
+
+        self.info_label = QLabel("")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._error = None
+
+    def _validate(self):
+        if not self.category_input.currentText().strip():
+            return "invalid_category", "Category can't be empty."
+        for field, label in ((self.download_limit_input, "download limit"),
+                             (self.upload_limit_input, "upload limit")):
+            try:
+                parse_size_to_bytes(field.text())
+            except ValueError:
+                return "invalid_speed_limit", f"Could not parse the {label} (e.g. '500 KB', '2 MB')."
+        ratio = self.seed_ratio_input.text().strip()
+        if ratio:
+            try:
+                if float(ratio) < 0:
+                    raise ValueError
+            except ValueError:
+                return "invalid_ratio", "Seed ratio limit should be a positive number, e.g. '2.0'."
+        return None, ""
+
+    def _on_accept(self):
+        self._error, message = self._validate()
+        if self._error:
+            self.info_label.setText(message)
+            return
+        self.accept()
+
+    def get_data(self) -> dict:
+        ratio = self.seed_ratio_input.text().strip()
+        return {
+            "category": self.category_input.currentText().strip(),
+            "download_limit_bps": parse_size_to_bytes(self.download_limit_input.text()),
+            "upload_limit_bps": parse_size_to_bytes(self.upload_limit_input.text()),
+            "seed_ratio_limit": float(ratio) if ratio else 0.0,
+            "keep_seeding": self.keep_seeding_checkbox.isChecked(),
+        }

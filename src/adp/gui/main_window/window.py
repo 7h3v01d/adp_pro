@@ -86,6 +86,10 @@ class MainWindow(QMainWindow):
                 listen_port=settings.get("torrent_listen_port", 6881),
                 enable_dht=settings.get("torrent_enable_dht", True),
                 default_seed_ratio_limit=settings.get("torrent_default_seed_ratio_limit", 0.0),
+                stop_on_complete=settings.get("torrent_stop_on_complete", True),
+                max_active_downloads=settings.get("torrent_max_active_downloads", 3),
+                move_completed_dir=self._move_completed_dir(settings),
+                move_completed_by_category=settings.get("torrent_move_completed_by_category", False),
                 default_save_path=torrent_dir,
                 unavailable_path=unavailable_path,
             )
@@ -206,6 +210,15 @@ class MainWindow(QMainWindow):
             # download folder is read fresh from settings each time the Add
             # dialog opens, so it needs no explicit push here.
             if self.torrent_panel is not None:
+                self.torrent_panel.set_default_seed_ratio_limit(
+                    new_settings.get("torrent_default_seed_ratio_limit", 0.0))
+                self.torrent_panel.set_stop_on_complete(
+                    new_settings.get("torrent_stop_on_complete", True))
+                self.torrent_panel.set_max_active_downloads(
+                    new_settings.get("torrent_max_active_downloads", 3))
+                self.torrent_panel.set_move_completed(
+                    self._move_completed_dir(new_settings),
+                    new_settings.get("torrent_move_completed_by_category", False))
                 try:
                     new_torrent_dir = resolve_dir(
                         new_settings.get("torrent_download_dir"),
@@ -214,6 +227,16 @@ class MainWindow(QMainWindow):
                 except ConfiguredPathUnavailableError as e:
                     self.statusBar().showMessage(
                         f"Torrent folder unavailable: {e}. Existing folder kept.", 8000)
+
+    @staticmethod
+    def _move_completed_dir(settings):
+        """The move-on-complete folder, or None when the feature is off or
+        no folder is set. Not created here: an unplugged target drive is
+        reported per move (files left in place), never silently swapped."""
+        if not settings.get("torrent_move_completed", False):
+            return None
+        folder = (settings.get("torrent_move_completed_dir") or "").strip()
+        return os.path.expanduser(folder) if folder else None
 
     def apply_theme(self, theme_name: str):
         app = QApplication.instance()

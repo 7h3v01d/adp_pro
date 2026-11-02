@@ -32,6 +32,18 @@ DEFAULT_SETTINGS = {
     "torrent_listen_port": 6881,
     "torrent_enable_dht": True,
     "torrent_default_seed_ratio_limit": 0.0,
+    # Stop (pause) a torrent the moment its download completes instead of
+    # seeding indefinitely. A torrent the user explicitly resumes after
+    # completion is left to seed (see TorrentRecord.keep_seeding).
+    "torrent_stop_on_complete": True,
+    # How many torrents download at once; the rest wait as "Queued" and start
+    # as slots free up. 0 = no limit. (Stalled torrents don't take a slot.)
+    "torrent_max_active_downloads": 3,
+    # Move a torrent's files to another folder when its download completes
+    # (e.g. scratch drive -> media library). Off by default; blank dir = off.
+    "torrent_move_completed": False,
+    "torrent_move_completed_dir": "",
+    "torrent_move_completed_by_category": False,  # <dir>/<category>/...
     "api_port": 8765,
     # Storage locations. Empty string = the built-in default (a folder under
     # the per-user app-data dir). Set these to keep multi-GB downloads off

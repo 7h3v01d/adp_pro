@@ -64,6 +64,16 @@ class AddTorrentRequest(BaseModel):
     seed_ratio_limit: float = 0.0
 
 
+class UpdateTorrentRequest(BaseModel):
+    """PATCH body: every field optional; only the ones sent are changed."""
+    category: Optional[str] = Field(default=None, min_length=1)
+    download_limit_bps: Optional[int] = Field(default=None, ge=0, description="bytes/sec, 0 = unlimited")
+    upload_limit_bps: Optional[int] = Field(default=None, ge=0, description="bytes/sec, 0 = unlimited")
+    seed_ratio_limit: Optional[float] = Field(default=None, ge=0, description="0 = no limit")
+    keep_seeding: Optional[bool] = Field(
+        default=None, description="true = keep seeding after completion despite 'stop on complete'")
+
+
 class SelectTorrentFilesRequest(BaseModel):
     selected_indices: List[int]
 
@@ -170,6 +180,12 @@ def build_app(controller: AppController, key_store: ApiKeyStore) -> FastAPI:
     def get_torrent(torrent_id: str):
         return controller.get_torrent(torrent_id)
 
+    @app.patch("/torrents/{torrent_id}")
+    def update_torrent(torrent_id: str, body: UpdateTorrentRequest):
+        """Changes an added torrent's category, speed limits, seed ratio
+        limit and/or keep_seeding -- only the fields sent are updated."""
+        return controller.update_torrent(torrent_id, **body.model_dump(exclude_none=True))
+
     @app.post("/torrents/{torrent_id}/pause")
     def pause_torrent(torrent_id: str):
         return controller.pause_torrent(torrent_id)
@@ -177,6 +193,11 @@ def build_app(controller: AppController, key_store: ApiKeyStore) -> FastAPI:
     @app.post("/torrents/{torrent_id}/resume")
     def resume_torrent(torrent_id: str):
         return controller.resume_torrent(torrent_id)
+
+    @app.post("/torrents/{torrent_id}/start_now")
+    def start_torrent_now(torrent_id: str):
+        """Starts a queued torrent immediately, skipping the download limit."""
+        return controller.start_torrent_now(torrent_id)
 
     @app.post("/torrents/{torrent_id}/force_recheck")
     def force_recheck_torrent(torrent_id: str):

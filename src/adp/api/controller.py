@@ -342,7 +342,25 @@ class AppController:
 
     def _resume_torrent_impl(self, torrent_id: str) -> dict:
         self._require_torrent_handle(torrent_id)
-        self.torrent_panel.engine.resume(torrent_id)
+        # Panel-level resume so a resumed *completed* torrent is marked to
+        # keep seeding, same as the GUI's Resume action.
+        self.torrent_panel.resume_torrent(torrent_id)
+        return self._serialize_torrent(torrent_id)
+
+    def start_torrent_now(self, torrent_id: str) -> dict:
+        self._require_torrent_support()
+        return self.bridge.call(self._start_torrent_now_impl, torrent_id)
+
+    def _start_torrent_now_impl(self, torrent_id: str) -> dict:
+        """Force-starts a QUEUED torrent past the active-downloads limit.
+        Anything else is refused (409) rather than silently changing how a
+        running or user-paused torrent is managed."""
+        self._require_torrent_handle(torrent_id)
+        engine = self.torrent_panel.engine
+        if not engine.is_queued(engine.handles[torrent_id].status()):
+            raise ApiError("Only a QUEUED torrent can be started now; use resume for a paused one.",
+                           status_code=409)
+        engine.start_now(torrent_id)
         return self._serialize_torrent(torrent_id)
 
     def remove_torrent(self, torrent_id: str, delete_files: bool = False) -> dict:
@@ -351,14 +369,9 @@ class AppController:
 
     def _remove_torrent_impl(self, torrent_id: str, delete_files: bool) -> dict:
         self._require_torrent_handle(torrent_id)
-        self.torrent_panel.engine.remove(torrent_id, delete_files=delete_files)
-        self.torrent_panel.records.pop(torrent_id, None)
-        self.torrent_panel.session_store.delete_resume_data(torrent_id)
-        for i in range(self.torrent_panel.torrent_list.count()):
-            item = self.torrent_panel.torrent_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == torrent_id:
-                self.torrent_panel.torrent_list.takeItem(i)
-                break
+        # Same removal path as the GUI, minus the confirmation prompt: an API
+        # caller's delete_files=True is already an explicit request.
+        self.torrent_panel.remove_torrent(torrent_id, delete_files=delete_files)
         return {"torrent_id": torrent_id, "removed": True, "deleted_files": delete_files}
 
     def force_recheck_torrent(self, torrent_id: str) -> dict:
@@ -391,20 +404,78 @@ class AppController:
             record.file_priorities = {i: p.value for i, p in priorities.items()}
         return self._serialize_torrent(torrent_id)
 
+    def update_torrent(self, torrent_id: str, category: Optional[str] = None,
+                       download_limit_bps: Optional[int] = None, upload_limit_bps: Optional[int] = None,
+                       seed_ratio_limit: Optional[float] = None, keep_seeding: Optional[bool] = None) -> dict:
+        """Partial update of an added torrent's settings -- the API twin of
+        the GUI's Properties dialog. Only the fields given change; omitted
+        (None) fields keep their current value. Limits are bytes/sec with 0
+        meaning unlimited; seed_ratio_limit 0 means no limit; keep_seeding
+        exempts the torrent from the global 'stop on complete' setting."""
+        self._require_torrent_support()
+        changes = self._validate_torrent_update(category, download_limit_bps, upload_limit_bps,
+                                                seed_ratio_limit, keep_seeding)
+        return self.bridge.call(self._update_torrent_impl, torrent_id, changes)
+
+    @staticmethod
+    def _validate_torrent_update(category, download_limit_bps, upload_limit_bps,
+                                 seed_ratio_limit, keep_seeding) -> dict:
+        """Pure validation, done before touching the GUI thread. Strict on
+        types: MCP callers aren't schema-checked the way REST bodies are, and
+        e.g. True must not sneak through as a 1 B/s limit."""
+        changes = {}
+        if category is not None:
+            if not isinstance(category, str) or not category.strip():
+                raise ApiError("category must be a non-empty string.")
+            changes["category"] = category.strip()
+        for name, value in (("download_limit_bps", download_limit_bps),
+                            ("upload_limit_bps", upload_limit_bps)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ApiError(f"{name} must be a whole number of bytes/sec >= 0 (0 = unlimited).")
+            changes[name] = value
+        if seed_ratio_limit is not None:
+            if isinstance(seed_ratio_limit, bool) or not isinstance(seed_ratio_limit, (int, float)) \
+                    or seed_ratio_limit < 0 or seed_ratio_limit != seed_ratio_limit:  # NaN check
+                raise ApiError("seed_ratio_limit must be a number >= 0 (0 = no limit).")
+            changes["seed_ratio_limit"] = float(seed_ratio_limit)
+        if keep_seeding is not None:
+            if not isinstance(keep_seeding, bool):
+                raise ApiError("keep_seeding must be true or false.")
+            changes["keep_seeding"] = keep_seeding
+        if not changes:
+            raise ApiError("Nothing to update: give at least one of category, download_limit_bps, "
+                           "upload_limit_bps, seed_ratio_limit, keep_seeding.")
+        return changes
+
+    def _update_torrent_impl(self, torrent_id: str, changes: dict) -> dict:
+        self._require_torrent_handle(torrent_id)
+        record = self.torrent_panel.records.get(torrent_id)
+        if record is None:
+            raise ApiError(f"Torrent '{torrent_id}' has no stored settings to update.", status_code=409)
+        merged = {
+            "category": record.category,
+            "download_limit_bps": record.download_limit_bps,
+            "upload_limit_bps": record.upload_limit_bps,
+            "seed_ratio_limit": record.seed_ratio_limit,
+            "keep_seeding": record.keep_seeding,
+        }
+        merged.update(changes)
+        self.torrent_panel.apply_properties(torrent_id, **merged)
+        return self._serialize_torrent(torrent_id)
+
     def _require_torrent_handle(self, torrent_id: str):
         if torrent_id not in self.torrent_panel.engine.handles:
             raise ApiError(f"No torrent with id '{torrent_id}'", status_code=404)
 
     def _serialize_torrent(self, torrent_id: str) -> dict:
-        from adp.torrent.models import LT_STATE_TO_TORRENT_STATE, TorrentState
-
         handle = self.torrent_panel.engine.handles[torrent_id]
         status = handle.status()
         record = self.torrent_panel.records.get(torrent_id)
 
-        state = LT_STATE_TO_TORRENT_STATE.get(int(status.state), TorrentState.DOWNLOADING)
-        if status.paused and state != TorrentState.FINISHED:
-            state = TorrentState.PAUSED
+        engine = self.torrent_panel.engine
+        state = engine.state_from_status(status)  # same rules as the GUI rows
 
         files = []
         if status.has_metadata:
@@ -437,9 +508,13 @@ class AppController:
             "num_seeds": status.num_seeds,
             "ratio": ratio,
             "seed_ratio_limit": record.seed_ratio_limit if record else 0.0,
+            "download_limit_bps": record.download_limit_bps if record else 0,
+            "upload_limit_bps": record.upload_limit_bps if record else 0,
+            "keep_seeding": record.keep_seeding if record else False,
             "is_seeding": status.is_seeding,
             "is_finished": status.is_finished,
             "paused": status.paused,
+            "queued": engine.is_queued(status),
             "has_metadata": status.has_metadata,
             "files": files,
         }

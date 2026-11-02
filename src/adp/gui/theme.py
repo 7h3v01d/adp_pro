@@ -179,6 +179,9 @@ QLabel#categoryBadge {{
     border: 1px solid {steel}; padding: 1px 8px; font-size: 11px; letter-spacing: 1px;
 }}
 
+/* -- hint captions (free-space readouts, restart notes) -- */
+QLabel#hint {{ color: {dim}; font-size: 11px; }}
+
 /* -- group boxes -- */
 /* A styled QWidget makes Qt stop drawing the native groupbox frame/title,
    so we must position them ourselves: a top margin opens room for the

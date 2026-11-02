@@ -41,8 +41,9 @@ def build_mcp_server(controller: AppController) -> FastMCP:
             "Control a running Accelerated Downloader Pro instance: add, list, "
             "pause/resume/stop/retry/remove HTTP downloads, and (when torrent "
             "support is installed) add/list/pause/resume/remove torrents by "
-            "magnet link or .torrent file, select which files in a torrent to "
-            "download, and read session/lifetime stats."
+            "magnet link or .torrent file, change a torrent's category, speed "
+            "limits, seed ratio limit and keep-seeding setting, select which "
+            "files in a torrent to download, and read session/lifetime stats."
         ),
     )
 
@@ -145,6 +146,13 @@ def build_mcp_server(controller: AppController) -> FastMCP:
         return controller.resume_torrent(torrent_id)
 
     @mcp.tool()
+    def start_torrent_now(torrent_id: str) -> dict:
+        """Starts a QUEUED torrent (state QUEUED / queued=true -- waiting for
+        a free slot under the app's max-active-downloads limit) immediately,
+        skipping the queue. Fails for torrents that aren't queued."""
+        return controller.start_torrent_now(torrent_id)
+
+    @mcp.tool()
     def remove_torrent(torrent_id: str, delete_files: bool = False) -> dict:
         """Removes a torrent from the app. If delete_files is true, also
         deletes the downloaded data from disk -- use with care."""
@@ -156,6 +164,21 @@ def build_mcp_server(controller: AppController) -> FastMCP:
         against the torrent's hashes (useful if the files may have been
         modified or corrupted outside the app)."""
         return controller.force_recheck_torrent(torrent_id)
+
+    @mcp.tool()
+    def update_torrent(torrent_id: str, category: Optional[str] = None,
+                       download_limit_bps: Optional[int] = None, upload_limit_bps: Optional[int] = None,
+                       seed_ratio_limit: Optional[float] = None, keep_seeding: Optional[bool] = None) -> dict:
+        """Changes settings of a torrent that's already been added. Only the
+        arguments you pass are changed. download_limit_bps/upload_limit_bps
+        are bytes per second (0 = unlimited); seed_ratio_limit stops seeding
+        at that upload/download ratio (0 = no limit); keep_seeding=true keeps
+        it seeding after completion even when the app's 'stop torrents when
+        download completes' setting is on (false = stop it when complete)."""
+        return controller.update_torrent(
+            torrent_id, category=category, download_limit_bps=download_limit_bps,
+            upload_limit_bps=upload_limit_bps, seed_ratio_limit=seed_ratio_limit,
+            keep_seeding=keep_seeding)
 
     @mcp.tool()
     def select_torrent_files(torrent_id: str, selected_indices: list) -> dict:
