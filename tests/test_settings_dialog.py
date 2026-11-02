@@ -33,7 +33,7 @@ def test_free_space_label_populated_for_real_dir(qtbot, tmp_path):
     dialog = SettingsDialog(current_settings={"download_dir": str(tmp_path)})
     qtbot.addWidget(dialog)
     # Constructor calls _update_free_space_label once.
-    assert "free" in dialog.free_space_label.text().lower()
+    assert "free" in dialog.download_free_space_label.text().lower()
 
 
 def test_existing_settings_preserved_through_dialog(qtbot):
@@ -93,3 +93,90 @@ def test_metadata_autofill_uses_configured_dir(qtbot, tmp_path):
     dialog.on_metadata_fetched(1000, "bytes", "etag", "lm", "cool-file.iso")
     import os
     assert dialog.path_input.text() == os.path.join(configured, "cool-file.iso")
+
+
+def test_stop_on_complete_defaults_on(qtbot):
+    dialog = SettingsDialog(current_settings={})
+    qtbot.addWidget(dialog)
+    assert dialog.torrent_stop_on_complete_checkbox.isChecked()
+    assert dialog.get_settings()["torrent_stop_on_complete"] is True
+
+
+def test_stop_on_complete_round_trip_off(qtbot):
+    dialog = SettingsDialog(current_settings={"torrent_stop_on_complete": False})
+    qtbot.addWidget(dialog)
+    assert not dialog.torrent_stop_on_complete_checkbox.isChecked()
+    dialog.torrent_stop_on_complete_checkbox.setChecked(True)
+    assert dialog.get_settings()["torrent_stop_on_complete"] is True
+
+
+def test_torrent_record_keep_seeding_round_trip():
+    from adp.torrent.models import TorrentRecord
+    rec = TorrentRecord(torrent_id="a" * 40, name="x", save_path="/tmp", keep_seeding=True)
+    assert TorrentRecord.from_dict(rec.to_dict()).keep_seeding is True
+    # Sessions saved before this field existed load with the default.
+    legacy = rec.to_dict()
+    legacy.pop("keep_seeding")
+    assert TorrentRecord.from_dict(legacy).keep_seeding is False
+
+
+def test_settings_are_grouped_into_tabs(qtbot):
+    dialog = SettingsDialog(current_settings={})
+    qtbot.addWidget(dialog)
+    titles = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
+    assert titles == ["General", "Downloads", "Torrents"]
+    page = {t: dialog.tabs.widget(i) for i, t in enumerate(titles)}
+    assert page["General"].isAncestorOf(dialog.theme_input)
+    assert page["General"].isAncestorOf(dialog.minimize_to_tray_checkbox)
+    assert page["Downloads"].isAncestorOf(dialog.download_dir_input)
+    assert page["Downloads"].isAncestorOf(dialog.verify_tls_checkbox)
+    assert page["Downloads"].isAncestorOf(dialog.download_free_space_label)
+    for w in (dialog.torrent_dir_input, dialog.torrent_stop_on_complete_checkbox,
+              dialog.torrent_seed_ratio_input, dialog.torrent_listen_port_input,
+              dialog.torrent_dht_checkbox, dialog.torrent_free_space_label):
+        assert page["Torrents"].isAncestorOf(w)
+
+
+def test_each_folder_gets_its_own_free_space_readout(qtbot, tmp_path):
+    dialog = SettingsDialog(current_settings={"torrent_download_dir": str(tmp_path)})
+    qtbot.addWidget(dialog)
+    assert "free" in dialog.torrent_free_space_label.text().lower()
+    assert "app-data" in dialog.download_free_space_label.text().lower()
+
+
+def test_max_active_downloads_setting(qtbot):
+    dialog = SettingsDialog(current_settings={})
+    qtbot.addWidget(dialog)
+    assert dialog.torrent_max_active_input.value() == 3
+    assert dialog.get_settings()["torrent_max_active_downloads"] == 3
+    dialog.torrent_max_active_input.setValue(0)
+    assert dialog.torrent_max_active_input.text() == "Unlimited"
+    assert dialog.get_settings()["torrent_max_active_downloads"] == 0
+    torrents_tab = dialog.tabs.widget(2)
+    assert torrents_tab.isAncestorOf(dialog.torrent_max_active_input)
+
+
+def test_move_completed_settings_round_trip(qtbot, tmp_path):
+    dialog = SettingsDialog(current_settings={})
+    qtbot.addWidget(dialog)
+    assert not dialog.torrent_move_checkbox.isChecked()
+    assert not dialog.torrent_move_dir_input.isEnabled()  # greyed out while off
+    dialog.torrent_move_checkbox.setChecked(True)
+    assert dialog.torrent_move_dir_input.isEnabled()
+    dialog.torrent_move_dir_input.setText(str(tmp_path))
+    dialog.torrent_move_by_category_checkbox.setChecked(True)
+    out = dialog.get_settings()
+    assert out["torrent_move_completed"] is True
+    assert out["torrent_move_completed_dir"] == str(tmp_path)
+    assert out["torrent_move_completed_by_category"] is True
+    assert "free" in dialog.torrent_move_free_space_label.text().lower()
+    assert dialog.tabs.widget(2).isAncestorOf(dialog.torrent_move_dir_input)
+
+
+def test_move_completed_dir_resolution():
+    from adp.gui.main_window.window import MainWindow
+    f = MainWindow._move_completed_dir
+    assert f({}) is None
+    assert f({"torrent_move_completed": True, "torrent_move_completed_dir": "  "}) is None
+    assert f({"torrent_move_completed": False, "torrent_move_completed_dir": "E:/Lib"}) is None
+    assert f({"torrent_move_completed": True, "torrent_move_completed_dir": "E:/Lib"}) == "E:/Lib"

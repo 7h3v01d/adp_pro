@@ -97,6 +97,49 @@ def leech_dir(tmp_path):
     return str(d)
 
 
+# Engine settings for every test session: loopback-only, no LSD/UPnP/NAT-PMP.
+# Tests talk to tests/torrent_swarm.LocalSeed directly via connect_peer(), so
+# none of these are needed -- and with them on, a session on a real LAN
+# chats to the router (UPnP/NAT-PMP mappings) and blocks for seconds when it
+# is destroyed, which froze the GUI thread mid-test on Windows.
+OFFLINE_ENGINE_OPTIONS = dict(
+    bind_address="127.0.0.1", enable_lsd=False, enable_upnp=False, enable_natpmp=False,
+)
+
+
+@pytest.fixture
+def make_torrent_panel(qtbot):
+    """Factory for offline TorrentPanels. Each panel is torn down
+    deterministically at the end of the test (torrents removed, libtorrent
+    session destroyed) instead of whenever the GC frees it -- which used to
+    be in the middle of the *next* test, on the GUI thread."""
+    pytest.importorskip("libtorrent")
+    from adp.gui.torrent_panel import TorrentPanel
+    panels = []
+
+    def make(add_widget=True, **kwargs):
+        kwargs.setdefault("listen_port", 0)
+        kwargs.setdefault("enable_dht", False)
+        kwargs.setdefault("engine_options", OFFLINE_ENGINE_OPTIONS)
+        panel = TorrentPanel(**kwargs)
+        if add_widget:
+            qtbot.addWidget(panel)
+        panels.append(panel)
+        return panel
+
+    yield make
+    for panel in panels:
+        engine = panel.engine
+        if engine.session is None:
+            continue
+        for torrent_id in list(engine.handles.keys()):
+            try:
+                engine.remove(torrent_id, delete_files=False)
+            except Exception:  # noqa: BLE001 -- teardown must not mask the test result
+                pass
+        engine.shutdown()
+
+
 @pytest.fixture
 def leech_engine():
     if LocalSeed is None:
@@ -116,7 +159,7 @@ def leech_engine():
         extra_settings={"auto_manage_interval": 1},
     )
     yield engine
-    engine.stop()
+    engine.shutdown()
 
 
 _exit_status = {"code": 0}

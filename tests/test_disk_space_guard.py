@@ -57,14 +57,8 @@ class TestTorrentPanelSpaceGuard:
     only because constructing the panel spins up a libtorrent session."""
 
     @pytest.fixture
-    def panel(self, qtbot, tmp_path):
-        pytest.importorskip("libtorrent")
-        from adp.gui.torrent_panel import TorrentPanel
-        p = TorrentPanel(state_dir=str(tmp_path), listen_port=0, enable_dht=False)
-        qtbot.addWidget(p)
-        yield p
-        for torrent_id in list(p.engine.handles.keys()):
-            p.engine.remove(torrent_id, delete_files=False)
+    def panel(self, make_torrent_panel, tmp_path):
+        return make_torrent_panel(state_dir=str(tmp_path))
 
     def test_pauses_when_insufficient_space(self, qtbot, tmp_path, monkeypatch, panel):
         import adp.gui.torrent_panel as tp

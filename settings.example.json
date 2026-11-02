@@ -11,6 +11,11 @@
   "torrent_listen_port": 6881,
   "torrent_enable_dht": true,
   "torrent_default_seed_ratio_limit": 0.0,
+  "torrent_stop_on_complete": true,
+  "torrent_max_active_downloads": 3,
+  "torrent_move_completed": false,
+  "torrent_move_completed_dir": "",
+  "torrent_move_completed_by_category": false,
 
   "api_port": 8765,
 

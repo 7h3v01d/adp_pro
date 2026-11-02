@@ -187,6 +187,10 @@ def test_resume_after_progress_file_exists(qapp, thread_pool, mock_server, downl
 def test_stop_cleans_up_progress_file(qapp, thread_pool, mock_server, download_dir):
     big_content = os.urandom(2_000_000)
     manager = make_manager(qapp, thread_pool, mock_server, download_dir, content=big_content, num_threads=2)
+    # Throttle so the test reliably observes DOWNLOADING: unthrottled, 2 MB
+    # from the local mock server sometimes completed before the first check
+    # (a test race, ~1 run in 10 -- the stop/cleanup path itself was fine).
+    manager.set_speed_limit(500_000)
     manager.start()
 
     assert pump_events(qapp, lambda: manager.status == Status.DOWNLOADING and manager.downloaded_size > 0)

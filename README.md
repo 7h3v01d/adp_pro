@@ -41,16 +41,48 @@ headless-testable core engine.
 - Built on `libtorrent`, fully self-contained -- no external torrent app needed
 - Add via magnet link or `.torrent` file
 - Per-file selection (choose which files in a multi-file torrent to grab)
-- DHT (trackerless peer discovery), seeding after completion, force recheck
+- DHT (trackerless peer discovery), stop-on-complete (default) or seeding, force recheck
 - Per-torrent download/upload speed limits and an optional seed ratio limit
   (once reached, the torrent auto-stops seeding)
 - Session persistence across restarts using libtorrent's own resume-data,
   so a restart resumes quickly instead of doing a full recheck
 
-Torrents keep seeding after they finish downloading by default (normal
-torrent etiquette) -- right-click a finished torrent and choose **Stop
-Seeding** to stop it manually, or set a seed ratio limit when adding it (or
-a default one in Settings) to have it stop automatically once reached.
+Torrents stop as soon as their download completes by default (Settings ->
+**Stop torrents when download completes**, on by default). A stopped
+completed torrent shows as *Finished*; right-click it and choose **Start
+Seeding** to seed that one deliberately -- it's then left seeding, even
+across restarts. Untick the setting to seed everything after completion
+(normal torrent etiquette), optionally with a seed ratio limit set when
+adding a torrent (or a default one in Settings) to stop it once reached.
+
+Select several torrents with Ctrl/Shift-click (or Ctrl+A) and the right-click
+actions apply to all of them; **Delete** removes the selection. **Remove and
+Delete Files** always asks for confirmation (as does removing several at
+once), and **Remove All Completed** clears finished torrents from the list
+while keeping their files.
+
+At most **3 torrents download at once** by default (Settings -> Torrents ->
+**Max active downloads**, 0 = unlimited; applies immediately). The rest show
+as *Queued -- waiting for a free download slot* and start automatically as
+slots free up; stalled torrents don't hold a slot. Right-click a queued
+torrent and choose **Start Now (skip queue)** to start it regardless (API:
+`POST /torrents/{id}/start_now`, MCP: `start_torrent_now`). Seeding is never
+queued.
+
+**Move completed torrents** (Settings -> Torrents, off by default) moves a
+torrent's files to another folder when it finishes -- e.g. download to a
+scratch drive, land in your library -- optionally into a subfolder per
+category. Right-click **Move Files...** moves selected torrents on demand.
+Moves are done by libtorrent while the torrent stays loaded (a rename on the
+same drive, copy-then-delete across drives), and are safe by design: existing
+files are never overwritten, a move to another drive that won't fit is
+skipped up front, an unavailable destination is reported, and in every
+failure case the files stay where they were. Torrents that were already
+complete (e.g. when you first enable the setting) are not moved.
+
+**Properties...** (right-click, or double-click a torrent) edits an added
+torrent's category, download/upload limits, seed ratio limit and "keep
+seeding" setting; changes apply immediately and are saved with the session.
 
 **Torrent search** (its own "Search" tab, plus REST + MCP)
 - Searches multiple torrent indexers at once and merges the results:
@@ -215,9 +247,22 @@ curl -H "X-API-Key: <your key>" -H "Content-Type: application/json" \
 
 Endpoints: `GET/POST /downloads`, `GET/POST/DELETE /downloads/{id}` plus
 `/pause`, `/resume`, `/stop`, `/retry`; the same shape under `/torrents`
-(swap `/stop`+`/retry` for `/force_recheck`+`/select_files`); and
-`GET /stats`. Interactive docs (Swagger UI) are at `/docs` once the app is
-running.
+(swap `/stop`+`/retry` for `/force_recheck`+`/select_files`), plus
+`PATCH /torrents/{id}` to change a torrent's settings and
+`POST /torrents/{id}/start_now` to skip the download queue; and `GET /stats`.
+Interactive docs (Swagger UI) are at `/docs` once the app is running.
+
+`PATCH /torrents/{id}` (MCP tool: `update_torrent`) is the API version of the
+Properties dialog. Send only the fields to change -- `category`,
+`download_limit_bps` / `upload_limit_bps` (bytes/sec, 0 = unlimited),
+`seed_ratio_limit` (0 = no limit), `keep_seeding` (true = keep seeding after
+completion despite "stop on complete"):
+
+```bash
+curl -X PATCH -H "X-API-Key: <your key>" -H "Content-Type: application/json" \
+     -d '{"download_limit_bps": 2097152, "keep_seeding": true}' \
+     http://127.0.0.1:8765/torrents/<torrent_id>
+```
 
 Two safety contracts worth knowing when driving the API programmatically
 (e.g. from an AI/MCP client that supplies paths directly):

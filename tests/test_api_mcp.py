@@ -97,7 +97,7 @@ def test_all_expected_tools_are_registered(qtbot, mcp_server):
         "list_downloads", "get_download", "add_download", "pause_download", "resume_download",
         "stop_download", "retry_download", "remove_download",
         "list_torrents", "get_torrent", "add_torrent", "pause_torrent", "resume_torrent",
-        "remove_torrent", "force_recheck_torrent", "select_torrent_files",
+        "remove_torrent", "force_recheck_torrent", "select_torrent_files", "update_torrent", "start_torrent_now",
         "get_stats",
     }
     assert expected.issubset(names)
