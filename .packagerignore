@@ -15,4 +15,4 @@ sync.bat
 test.bat
 
 # --- Excluded Misc Files --- 
-
+*.lnk
