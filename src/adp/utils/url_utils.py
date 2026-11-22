@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urlsplit, urlunsplit, parse_qsl
 
 DOWNLOADABLE_EXTENSIONS = {
     ".zip", ".rar", ".7z", ".tar", ".gz", ".xz", ".bz2",
@@ -127,3 +127,59 @@ def filename_from_url(url: str) -> str:
     """Best-effort filename from the final path segment of a URL,
     percent-decoded. Empty string if the URL has no usable path segment."""
     return unquote(os.path.basename(urlparse(url).path))
+
+
+# -- redaction for logs ------------------------------------------------------------
+REDACTED = "REDACTED"
+_URL_IN_TEXT = re.compile(r"""\b(?:https?|ftp)://[^\s'"<>]+""", re.IGNORECASE)
+_MAGNET_IN_TEXT = re.compile(r"""magnet:\?[^\s'"<>]+""", re.IGNORECASE)
+# Magnet params that identify the content and carry no credentials.
+_MAGNET_SAFE_PARAMS = {"xt", "dn", "xl"}
+# HTTP request lines as logged by urllib3: "GET /path?token=... HTTP/1.1"
+_REQUEST_LINE = re.compile(r"\b(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) (/\S*) (HTTP/\d(?:\.\d)?)")
+
+
+def redact_url(url: str) -> str:
+    """A URL safe to write to a log: scheme, host and path are kept (enough to
+    diagnose which server/file failed); credentials are not. Signed and
+    tokenised download links put bearer secrets in the query string
+    (?token=, X-Amz-Signature=, sig=, key=...) and some put user:password in
+    the authority, so every query *value* and any userinfo is replaced --
+    parameter names are kept for diagnosis -- and the fragment is dropped."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return REDACTED
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = f"{REDACTED}@{netloc.rsplit('@', 1)[1]}"
+    query = parts.query
+    if query:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        query = "&".join(f"{name}={REDACTED}" for name, _ in pairs) if pairs else REDACTED
+    return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+
+
+def _redact_magnet(magnet: str) -> str:
+    try:
+        pairs = parse_qsl(magnet.split("?", 1)[1], keep_blank_values=True)
+    except (IndexError, ValueError):
+        return "magnet:?" + REDACTED
+    # Trackers (tr=) on private sites embed the user's passkey.
+    return "magnet:?" + "&".join(
+        f"{k}={v if k.lower() in _MAGNET_SAFE_PARAMS else REDACTED}" for k, v in pairs)
+
+
+def redact_urls_in_text(text: str) -> str:
+    """Redacts every http(s)/ftp URL and magnet link found in free text --
+    log messages, and exception text (requests embeds the full URL in its
+    errors: "404 Client Error: Not Found for url: https://...?token=...")."""
+    if not text or ("://" not in text and "magnet:" not in text.lower() and " HTTP/" not in text):
+        return text
+    text = _REQUEST_LINE.sub(lambda m: f"{m.group(1)} {redact_url(m.group(2))} {m.group(3)}", text)
+    def _url(m):
+        url = m.group(0)
+        stripped = url.rstrip(".,;:!?)]}")  # sentence punctuation isn't part of the URL
+        return redact_url(stripped) + url[len(stripped):]
+    text = _URL_IN_TEXT.sub(_url, text)
+    return _MAGNET_IN_TEXT.sub(lambda m: _redact_magnet(m.group(0)), text)

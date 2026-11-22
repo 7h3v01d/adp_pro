@@ -46,6 +46,11 @@ def download_panel(qtbot, tmp_path, thread_pool):
     state_dir.mkdir()
     p = DownloadPanel(state_dir=str(state_dir), thread_pool=thread_pool)
     qtbot.addWidget(p)
+    # These tests download from a local mock server (127.0.0.1) into temp
+    # folders, so they opt in to both API-boundary settings the way a user
+    # would. The boundaries themselves are tested in test_api_trust_boundary.py.
+    p.settings["api_allow_private_network"] = True
+    p.settings["api_allow_any_save_path"] = True
     yield p
     for manager in list(p.downloads.values()):
         if manager.status.is_active or manager.status == Status.PAUSED:
@@ -234,3 +239,21 @@ def test_api_stop_rejects_illegal_transition(qtbot, controller, download_panel, 
     m.set_status(Status.COMPLETED)
     with pytest.raises(ApiError):
         call_from_thread(qtbot, controller.stop_download, m.download_id)
+
+
+@pytest.mark.parametrize("url_path,expected", [
+    ("my%20report.zip?token=abc", "my report.zip"),       # percent-decoded, query dropped
+    ("..%2F..%2Fevil.exe", "evil.exe"),                    # encoded traversal stripped
+    ("CON", "_CON"),                                       # Windows device name defused
+    ("a%3Cb%3E%3Ac.zip", "abc.zip"),                       # illegal characters removed
+    ("", "download"),                                      # nothing usable -> fallback
+])
+def test_api_derived_filename_uses_shared_sanitizer(qtbot, controller, download_panel, mock_server,
+                                                    tmp_path, url_path, expected):
+    """Review finding 10: the API derived filenames with a bare basename(),
+    unlike the metadata path's sanitize_filename(). Both now share it."""
+    configured = tmp_path / "dl"
+    configured.mkdir()
+    download_panel.settings["download_dir"] = str(configured)
+    result = call_from_thread(qtbot, controller.add_download, url=mock_server.url_for(url_path))
+    assert result["save_path"] == os.path.join(str(configured), expected)

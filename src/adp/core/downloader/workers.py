@@ -23,7 +23,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from adp.core.speed_limiter import SpeedLimiter
-from adp.core.downloader.http import CHUNK_READ_SIZE, RangeNotHonoredError
+from adp.core.downloader.http import (
+    CHUNK_READ_SIZE, RangeNotHonoredError, RemoteFileChangedError, if_range_value, validators_match,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +86,8 @@ class DownloadWorker(QRunnable):
 
     def __init__(self, manager, url, file_path, start_byte, end_byte, headers,
                  speed_limiter: Optional[SpeedLimiter] = None, session_factory=None,
-                 epoch: int = 0, verify_tls: bool = True, ranges_supported: bool = True):
+                 epoch: int = 0, verify_tls: bool = True, ranges_supported: bool = True,
+                 etag: Optional[str] = None, last_modified: Optional[str] = None):
         super().__init__()
         self.manager = manager
         self.url = url
@@ -97,6 +100,12 @@ class DownloadWorker(QRunnable):
         # exactly one worker covering the whole file in that case. When True,
         # ranged requests are strictly validated as 206 + Content-Range.
         self.ranges_supported = ranges_supported
+        # The server's validators from the metadata fetch. Every ranged
+        # request carries If-Range, and every 206 is checked against them, so
+        # a file replaced on the server mid-download (or between sessions)
+        # can't have its new bytes spliced onto our old ones.
+        self.etag = etag
+        self.last_modified = last_modified
         self.speed_limiter = speed_limiter
         self.signals = WorkerSignals()
         self.is_stopped = False
@@ -182,13 +191,17 @@ class DownloadWorker(QRunnable):
                     f"unparseable Content-Length: {content_length!r}")
 
     @staticmethod
-    def _build_default_session():
-        session = requests.Session()
-        retries = Retry(
+    def default_retries():
+        return Retry(
             total=3, read=3, connect=3,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
         )
+
+    @staticmethod
+    def _build_default_session():
+        session = requests.Session()
+        retries = DownloadWorker.default_retries()
         adapter = HTTPAdapter(max_retries=retries)
         session.mount('http://', adapter)
         session.mount('https://', adapter)
@@ -210,8 +223,12 @@ class DownloadWorker(QRunnable):
 
         try:
             req_headers = dict(self.headers)
+            if_range = None
             if self.ranges_supported:
                 req_headers['Range'] = f'bytes={current_pos}-{self.end_byte}'
+                if_range = if_range_value(self.etag, self.last_modified)
+                if if_range:
+                    req_headers['If-Range'] = if_range
             with session.get(self.url, headers=req_headers, stream=True, timeout=30, verify=self.verify_tls) as r:
                 logger.debug(
                     "[%s] Response for chunk %d-%d: HTTP %d, Content-Length=%s, Content-Range=%s",
@@ -220,6 +237,18 @@ class DownloadWorker(QRunnable):
                 )
                 r.raise_for_status()
                 if self.ranges_supported:
+                    if if_range and r.status_code == 200:
+                        # If-Range didn't match: the server is telling us the
+                        # file changed and is sending the new one whole.
+                        raise RemoteFileChangedError(
+                            "server answered If-Range with HTTP 200: the file changed on the server")
+                    if not validators_match(self.etag, self.last_modified, r.headers):
+                        # Server ignored If-Range but its validators show a
+                        # different file -- same outcome, caught here.
+                        raise RemoteFileChangedError(
+                            f"server validators changed mid-download (ETag {self.etag!r} -> "
+                            f"{r.headers.get('ETag')!r}, Last-Modified {self.last_modified!r} -> "
+                            f"{r.headers.get('Last-Modified')!r})")
                     # SECURITY/CORRECTNESS: we sent a Range request, so the ONLY
                     # acceptable answer is 206 Partial Content with a matching
                     # Content-Range. A 200 means the server ignored the range and

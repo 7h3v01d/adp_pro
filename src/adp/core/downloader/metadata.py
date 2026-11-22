@@ -28,8 +28,12 @@ class MetadataFetcherSignals(QObject):
 
 
 class MetadataFetcher(QRunnable):
-    def __init__(self, url, headers=None, signals=None, verify_tls: bool = True):
+    def __init__(self, url, headers=None, signals=None, verify_tls: bool = True,
+                 session_factory=None):
         super().__init__()
+        # session_factory: builds the requests.Session to use -- e.g. the
+        # public-only session for API-added downloads (core/net_policy.py).
+        self.session_factory = session_factory
         self.url = url
         self.headers = headers or BROWSER_HEADERS
         self.signals = signals
@@ -48,12 +52,15 @@ class MetadataFetcher(QRunnable):
             self.signals.error_occurred.emit(message)
             return
 
-        session = requests.Session()
-        session.headers.update(self.headers)
         retries = Retry(total=3, backoff_factor=0.5)
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
+        if self.session_factory is not None:
+            session = self.session_factory(retries)
+        else:
+            session = requests.Session()
+            adapter = HTTPAdapter(max_retries=retries)
+            session.mount('http://', adapter)
+            session.mount('https://', adapter)
+        session.headers.update(self.headers)
 
         response = None
         try:

@@ -25,6 +25,12 @@ headless-testable core engine.
   fails the download instead of silently writing corrupt data; transfer
   compression is disabled on downloads so byte offsets always mean raw bytes
 - Fail-safe recovery if resume state is ever corrupt/inconsistent
+- Never splices two versions of a file: resuming requires the server's ETag
+  (or, without one, Last-Modified) to match what the partial bytes came
+  from; every range request carries `If-Range` and every response is checked,
+  so a file replaced on the server mid-download stops the download with a
+  clear message (Retry fetches the new version cleanly). With no validators
+  at all, a resume restarts from zero unless you supplied a checksum
 - Per-download and default bandwidth throttling (token-bucket limiter)
 
 **API access** (REST + MCP, always on)
@@ -286,6 +292,29 @@ each tool exposes to the calling model.
 
 ### Security notes
 
+**Automation gets less authority than you do.** Two limits apply to
+everything requested through the REST/MCP API (both on by default, both
+switchable in Settings -> **API**; nothing you do in the app itself is
+restricted):
+
+- **Public internet only.** An API download may not reach private, loopback,
+  link-local or other non-public addresses (your router, NAS, `localhost`
+  services, cloud metadata endpoints). It's checked when the download is
+  added, again on **every redirect** (so a public link that redirects into
+  your LAN is stopped), and on the address actually connected to (so DNS
+  rebinding can't sneak past). Refused requests get HTTP 403 with the reason.
+  Tick *Allow API downloads from the local network* if your own tools need
+  it -- it applies live, including to retries. These downloads ignore system
+  proxy settings, which would otherwise hide the real destination.
+  (Torrent trackers aren't covered by this policy; libtorrent's own SSRF
+  mitigation blocks the localhost cases.)
+- **Your folders only.** An API download or torrent may only be saved inside
+  the folders configured on the Downloads / Torrents tabs (subfolders are
+  created as needed). Paths are fully resolved first, so `..` segments,
+  symlinks and junctions can't escape. Combined with `overwrite=true`, an
+  unrestricted path would let an automated caller replace any file you can
+  write -- tick *Allow API to save anywhere* only if you need that.
+
 - The API can add/pause/remove downloads and torrents -- treat the key
   like a password. It's stored locally at `<app data dir>/api_key.txt`;
   regenerate it from the API Access dialog if it's ever been exposed
@@ -294,6 +323,24 @@ each tool exposes to the calling model.
   internet) can reach it.
 - No CORS headers are added anywhere, so a malicious web page can't
   silently drive the API through a browser even if it somehow knew the key.
+- **What the key does and doesn't protect against:** it stops
+  unauthenticated local clients and browser/web-origin attacks. It does
+  *not* stop hostile software already running as your Windows user -- that
+  can read `api_key.txt` like any other file in your profile (on Windows the
+  file has no special ACL; it's protected only by living under `%APPDATA%`).
+  This is inherent to any local bearer token.
+- Request bodies over ~15 MB (14.3 MiB) are refused before they're parsed (REST and
+  MCP), and string inputs (URLs, magnets, search text, categories, paths)
+  have generous length caps -- automated callers are treated as untrusted
+  input.
+- **Logs never contain URL secrets.** Every log line passes through a
+  redacting formatter: query-string values (`?token=`, `X-Amz-Signature=`
+  ...), `user:password@` and magnet tracker URLs are replaced with
+  `REDACTED`, including inside error messages and tracebacks. (Download
+  URLs are still stored unredacted in the session and `.progress` files,
+  because resuming needs them.)
+- **Searching isn't local:** your search text is sent to the enabled
+  providers (torrents-csv.com by default). The Search tab says where.
 
 ## Project layout
 

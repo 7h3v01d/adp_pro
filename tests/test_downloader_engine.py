@@ -150,6 +150,10 @@ def test_resume_after_progress_file_exists(qapp, thread_pool, mock_server, downl
     path = "resumable.bin"
     big_content = os.urandom(3_000_000)
     mock_server.add_file(path, big_content)
+    # Throttle the first session so the test can reliably pause mid-file:
+    # unthrottled, 3 MB over loopback completes in a few ms -- inside one
+    # poll interval -- so the pause was racing the download itself.
+    mock_server.set_throttle(path, 1_000_000)
     save_path = os.path.join(download_dir, path)
 
     first = DownloadManager("dl-a", mock_server.url_for(path), save_path, thread_pool, num_threads=1)
@@ -176,6 +180,7 @@ def test_resume_after_progress_file_exists(qapp, thread_pool, mock_server, downl
     qapp.processEvents()
     assert os.path.exists(first.progress_file)  # still intact -- only the handle was released
 
+    mock_server.set_throttle(path, 0)  # second session: full speed
     second = DownloadManager("dl-a", mock_server.url_for(path), save_path, thread_pool, num_threads=1)
     second.start()
     assert pump_events(qapp, lambda: second.status.is_terminal, timeout=15)

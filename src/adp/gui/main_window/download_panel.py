@@ -242,7 +242,8 @@ class DownloadPanel(QWidget):
 
     def add_download(self, url, save_path, checksum=None, num_threads=4, start_immediately=True,
                       headers=None, category=None, speed_limit_bps=0, scheduled_time=None,
-                      verify_tls=None, download_id=None, allow_overwrite=False):
+                      verify_tls=None, download_id=None, allow_overwrite=False,
+                      added_via_api=False):
         if not (url and save_path):
             return None, None
 
@@ -272,7 +273,10 @@ class DownloadPanel(QWidget):
         manager = DownloadManager(download_id, url, save_path, self.thread_pool, num_threads,
                                    checksum, headers=headers, category=category,
                                    speed_limit_bps=speed_limit_bps, verify_tls=verify_tls,
-                                   allow_overwrite=allow_overwrite)
+                                   allow_overwrite=allow_overwrite, added_via_api=added_via_api)
+        # Live setting, read each time the download (re)starts.
+        manager.network_policy_allows_private = (
+            lambda: bool(self.settings.get("api_allow_private_network", False)))
         self.downloads[download_id] = manager
 
         manager.progress_updated.connect(self.update_download_progress)
@@ -664,6 +668,7 @@ class DownloadPanel(QWidget):
                 destination_owned_by_adp=manager.destination_owned_by_adp,
                 restart_required=manager.restart_required,
                 allow_overwrite=manager.allow_overwrite,
+                added_via_api=manager.added_via_api,
             ))
         self.session_store.save(records)
 
@@ -684,7 +689,7 @@ class DownloadPanel(QWidget):
                 num_threads=record.num_threads, headers=record.headers, category=record.category,
                 speed_limit_bps=record.speed_limit_bps, scheduled_time=record.scheduled_time,
                 start_immediately=False, download_id=record.download_id,
-                verify_tls=record.verify_tls,
+                verify_tls=record.verify_tls, added_via_api=record.added_via_api,
             )
             manager = self.downloads.get(record.download_id)
             if manager is None:

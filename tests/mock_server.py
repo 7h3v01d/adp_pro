@@ -33,6 +33,37 @@ class RangeRequestHandler(http.server.BaseHTTPRequestHandler):
     throttle_bps: Dict[str, int] = {}
     # path -> extra response headers (e.g. Content-Disposition)
     extra_headers: Dict[str, Dict[str, str]] = {}
+    # path -> {"etag": "auto" | str | None, "last_modified": str | None}.
+    # Default: a strong ETag derived from the content, no Last-Modified.
+    validators: Dict[str, Dict[str, object]] = {}
+    # paths whose server ignores If-Range (some real servers do)
+    ignore_if_range: set = set()
+    # path -> Location: answer HEAD/GET with a 302 redirect there
+    redirects: Dict[str, str] = {}
+
+    def _maybe_redirect(self) -> bool:
+        location = self.redirects.get(self.path.lstrip('/').split('?')[0])
+        if location is None:
+            return False
+        self.send_response(302)
+        self.send_header('Location', location)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+        return True
+
+    def _current_validators(self, path, body):
+        v = self.validators.get(path, {})
+        etag = v.get("etag", "auto")
+        if etag == "auto":
+            etag = f'"{hashlib.md5(body).hexdigest()}"'
+        return etag, v.get("last_modified")
+
+    def _send_validators(self, path, body):
+        etag, last_modified = self._current_validators(path, body)
+        if etag:
+            self.send_header('ETag', etag)
+        if last_modified:
+            self.send_header('Last-Modified', last_modified)
 
     def _send_extra_headers(self, path):
         for name, value in self.extra_headers.get(path, {}).items():
@@ -49,6 +80,8 @@ class RangeRequestHandler(http.server.BaseHTTPRequestHandler):
         return self.path.lstrip('/') in self.forbidden_paths
 
     def do_HEAD(self):
+        if self._maybe_redirect():
+            return
         if self._is_forbidden():
             self.send_response(403)
             self.end_headers()
@@ -62,11 +95,13 @@ class RangeRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         if self.accept_ranges:
             self.send_header('Accept-Ranges', 'bytes')
-        self.send_header('ETag', f'"{hashlib.md5(body).hexdigest()}"')
+        self._send_validators(self.path.lstrip('/'), body)
         self._send_extra_headers(self.path.lstrip('/'))
         self.end_headers()
 
     def do_GET(self):
+        if self._maybe_redirect():
+            return
         if self._is_forbidden():
             self.send_response(403)
             self.end_headers()
@@ -90,6 +125,13 @@ class RangeRequestHandler(http.server.BaseHTTPRequestHandler):
                 start = int(m.group(1))
                 end = int(m.group(2)) if m.group(2) else total - 1
                 status = 206
+                # RFC 9110 If-Range: serve the range only if the validator
+                # still matches; otherwise the whole (new) representation.
+                if_range = self.headers.get('If-Range')
+                if if_range and path not in self.ignore_if_range:
+                    etag, last_modified = self._current_validators(path, body)
+                    if if_range not in (etag, last_modified):
+                        start, end, status = 0, total - 1, 200
 
         chunk = body[start:end + 1]
 
@@ -107,7 +149,7 @@ class RangeRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Range', f'bytes {start}-{end}/{total}')
         if self.accept_ranges:
             self.send_header('Accept-Ranges', 'bytes')
-        self.send_header('ETag', f'"{hashlib.md5(body).hexdigest()}"')
+        self._send_validators(path, body)
         self._send_extra_headers(path)
         self.end_headers()
         try:
@@ -137,13 +179,15 @@ class MockDownloadServer:
     """Context-manager-friendly wrapper that starts a RangeRequestHandler
     server on a background thread on an OS-assigned free port."""
 
-    def __init__(self, tls: bool = False):
+    def __init__(self, tls: bool = False, host: str = '127.0.0.1'):
         handler_cls = type('BoundHandler', (RangeRequestHandler,), {
             'files': {}, 'fail_after_bytes': {}, 'request_counts': {}, 'accept_ranges': True,
             'throttle_bps': {}, 'extra_headers': {}, 'forbidden_paths': set(),
+            'validators': {}, 'ignore_if_range': set(), 'redirects': {},
         })
         self.handler_cls = handler_cls
-        self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), handler_cls)
+        self.host = host
+        self.httpd = ThreadingHTTPServer((host, 0), handler_cls)
         self.tls = tls
         if tls:
             # Self-signed cert for 127.0.0.1 -- deliberately NOT trusted by
@@ -175,7 +219,7 @@ class MockDownloadServer:
 
     def url_for(self, path: str) -> str:
         scheme = "https" if self.tls else "http"
-        return f"{scheme}://127.0.0.1:{self.port}/{path}"
+        return f"{scheme}://{self.host}:{self.port}/{path}"
 
     def add_file(self, path: str, content: bytes):
         self.handler_cls.files[path] = content
@@ -198,6 +242,19 @@ class MockDownloadServer:
         """Attaches extra response headers (e.g. Content-Disposition) to
         every HEAD/GET response for `path`."""
         self.handler_cls.extra_headers[path] = dict(headers)
+
+    def set_validators(self, path: str, etag="auto", last_modified=None):
+        """Controls the ETag/Last-Modified sent for `path`: etag "auto" (a
+        strong ETag from the content), a fixed string, or None to omit it."""
+        self.handler_cls.validators[path] = {"etag": etag, "last_modified": last_modified}
+
+    def set_redirect(self, path: str, location: str):
+        """Answer HEAD/GET for `path` with a 302 to `location`."""
+        self.handler_cls.redirects[path] = location
+
+    def set_ignore_if_range(self, path: str, ignore: bool = True):
+        """Makes the server ignore If-Range for `path` (as some do)."""
+        (self.handler_cls.ignore_if_range.add if ignore else self.handler_cls.ignore_if_range.discard)(path)
 
     def fail_path_after(self, path: str, byte_offset: int):
         """Causes the server to drop the connection once `byte_offset` bytes

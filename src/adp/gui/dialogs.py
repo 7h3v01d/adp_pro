@@ -382,8 +382,33 @@ class SettingsDialog(QDialog):
         restart_note.setWordWrap(True)
         torrents.addRow(restart_note)
 
+        # -- API (what automation may do) ------------------------------------
+        self.api_private_network_checkbox = QCheckBox(
+            "Allow API downloads from the local network (LAN and this computer)")
+        self.api_private_network_checkbox.setChecked(settings.get("api_allow_private_network", False))
+        self.api_private_network_checkbox.setToolTip(
+            "Off: downloads requested through the API may only reach public internet addresses, "
+            "checked on every redirect and connection -- so an agent can't be used to fetch your "
+            "router, NAS or local services. Turn on if your own tools download from your LAN.")
+        self.api_any_path_checkbox = QCheckBox(
+            "Allow API to save files anywhere (not just the download and torrent folders)")
+        self.api_any_path_checkbox.setChecked(settings.get("api_allow_any_save_path", False))
+        self.api_any_path_checkbox.setToolTip(
+            "Off: API downloads and torrents can only be saved inside the folders set on the "
+            "Downloads and Torrents tabs (subfolders are fine).")
+        api_intro = QLabel(
+            "These limit what scripts and AI agents using ADP's REST/MCP API can do. "
+            "Anything you do in the app yourself is never restricted.")
+        api_intro.setObjectName("hint")
+        api_intro.setWordWrap(True)
+        api = QFormLayout()
+        api.addRow(api_intro)
+        api.addRow(self.api_private_network_checkbox)
+        api.addRow(self.api_any_path_checkbox)
+
         self.tabs = QTabWidget()
-        for title, form in (("General", general), ("Downloads", downloads), ("Torrents", torrents)):
+        for title, form in (("General", general), ("Downloads", downloads), ("Torrents", torrents),
+                            ("API", api)):
             page = QWidget()
             page.setLayout(form)
             self.tabs.addTab(page, title)
@@ -459,6 +484,8 @@ class SettingsDialog(QDialog):
             "torrent_move_completed": self.torrent_move_checkbox.isChecked(),
             "torrent_move_completed_dir": self.torrent_move_dir_input.text().strip(),
             "torrent_move_completed_by_category": self.torrent_move_by_category_checkbox.isChecked(),
+            "api_allow_private_network": self.api_private_network_checkbox.isChecked(),
+            "api_allow_any_save_path": self.api_any_path_checkbox.isChecked(),
         })
         return merged
 

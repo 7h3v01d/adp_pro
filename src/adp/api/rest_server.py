@@ -19,10 +19,11 @@ Security posture (read before changing any of this):
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
-from typing import Optional, List
+from typing import Annotated, Optional, List
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -31,7 +32,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from adp.api.auth import ApiKeyStore
-from adp.api.controller import AppController, ApiError
+from adp.api.controller import (
+    AppController, ApiError, MAX_CATEGORY_CHARS, MAX_CHECKSUM_CHARS, MAX_FILE_SELECTION,
+    MAX_MAGNET_CHARS, MAX_NAME_CHARS, MAX_PATH_CHARS, MAX_PROVIDER_NAME_CHARS, MAX_PROVIDERS,
+    MAX_REQUEST_BODY_BYTES, MAX_SEARCH_TEXT_CHARS, MAX_TORRENT_BASE64_CHARS, MAX_URL_CHARS,
+)
 from adp.api.mcp_tools import build_mcp_server
 
 logger = logging.getLogger(__name__)
@@ -41,11 +46,11 @@ logger = logging.getLogger(__name__)
 # Request/response models
 # ---------------------------------------------------------------------------
 class AddDownloadRequest(BaseModel):
-    url: str
-    save_path: Optional[str] = None
-    category: Optional[str] = None
+    url: str = Field(max_length=MAX_URL_CHARS)
+    save_path: Optional[str] = Field(default=None, max_length=MAX_PATH_CHARS)
+    category: Optional[str] = Field(default=None, max_length=MAX_CATEGORY_CHARS)
     num_threads: int = Field(default=4, ge=1, le=16)
-    checksum: Optional[str] = None
+    checksum: Optional[str] = Field(default=None, max_length=MAX_CHECKSUM_CHARS)
     speed_limit_bps: int = 0
     # None -> use the app-wide setting (which defaults to True). Only set
     # False for a server whose certificate the caller has decided to trust.
@@ -56,17 +61,17 @@ class AddDownloadRequest(BaseModel):
 
 
 class AddTorrentRequest(BaseModel):
-    magnet_uri: Optional[str] = None
-    torrent_file_base64: Optional[str] = None
-    torrent_file_name: str = "upload.torrent"
-    save_path: Optional[str] = None
-    category: str = "Torrents"
+    magnet_uri: Optional[str] = Field(default=None, max_length=MAX_MAGNET_CHARS)
+    torrent_file_base64: Optional[str] = Field(default=None, max_length=MAX_TORRENT_BASE64_CHARS + 4)
+    torrent_file_name: str = Field(default="upload.torrent", max_length=MAX_NAME_CHARS)
+    save_path: Optional[str] = Field(default=None, max_length=MAX_PATH_CHARS)
+    category: str = Field(default="Torrents", max_length=MAX_CATEGORY_CHARS)
     seed_ratio_limit: float = 0.0
 
 
 class UpdateTorrentRequest(BaseModel):
     """PATCH body: every field optional; only the ones sent are changed."""
-    category: Optional[str] = Field(default=None, min_length=1)
+    category: Optional[str] = Field(default=None, min_length=1, max_length=MAX_CATEGORY_CHARS)
     download_limit_bps: Optional[int] = Field(default=None, ge=0, description="bytes/sec, 0 = unlimited")
     upload_limit_bps: Optional[int] = Field(default=None, ge=0, description="bytes/sec, 0 = unlimited")
     seed_ratio_limit: Optional[float] = Field(default=None, ge=0, description="0 = no limit")
@@ -75,14 +80,73 @@ class UpdateTorrentRequest(BaseModel):
 
 
 class SelectTorrentFilesRequest(BaseModel):
-    selected_indices: List[int]
+    selected_indices: List[Annotated[int, Field(ge=0)]] = Field(max_length=MAX_FILE_SELECTION)
 
 
 class SearchRequest(BaseModel):
-    text: str
-    category: Optional[str] = None      # provider-neutral hint, e.g. "software"
-    providers: Optional[List[str]] = None
+    text: str = Field(max_length=MAX_SEARCH_TEXT_CHARS)
+    category: Optional[str] = Field(default=None, max_length=MAX_CATEGORY_CHARS)  # e.g. "software"
+    providers: Optional[List[Annotated[str, Field(max_length=MAX_PROVIDER_NAME_CHARS)]]] = Field(
+        default=None, max_length=MAX_PROVIDERS)
     limit: int = Field(default=50, ge=1, le=200)
+
+
+# ---------------------------------------------------------------------------
+# Body size limit (outermost middleware)
+# ---------------------------------------------------------------------------
+class BodySizeLimitMiddleware:
+    """Rejects any request body over `max_bytes` with 413 *before* it is
+    parsed -- so a multi-gigabyte JSON body never gets materialised in
+    memory just to fail a size check afterwards. Checks Content-Length up
+    front, and also counts bytes as they arrive (chunked uploads carry no
+    Content-Length). The accepted body is buffered (bounded by max_bytes)
+    and replayed to the app. Covers REST and the mounted MCP endpoint."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope.get("headers") or []).get(b"content-length")
+        if declared is not None:
+            try:
+                if int(declared) > self.max_bytes:
+                    await self._reject(send)
+                    return
+            except ValueError:
+                await self._reject(send, 400, "Invalid Content-Length header.")
+                return
+        messages, total = [], 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                messages.append(message)  # e.g. http.disconnect
+                break
+            total += len(message.get("body", b""))
+            if total > self.max_bytes:
+                await self._reject(send)
+                return
+            messages.append(message)
+            if not message.get("more_body", False):
+                break
+
+        async def replay():
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    async def _reject(self, send, status=413, detail=None):
+        detail = detail or f"Request body too large (max {self.max_bytes} bytes)."
+        body = json.dumps({"detail": detail}).encode()
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +183,9 @@ def build_app(controller: AppController, key_store: ApiKeyStore) -> FastAPI:
         lifespan=mcp_asgi_app.router.lifespan_context,
     )
     app.add_middleware(ApiKeyMiddleware, key_store=key_store)
+    # Added last = outermost: oversized bodies are refused before auth,
+    # parsing, or anything else touches them.
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
     app.add_exception_handler(ApiError, _api_error_handler)
     app.mount("/mcp", mcp_asgi_app)
 

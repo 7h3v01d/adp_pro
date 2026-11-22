@@ -29,6 +29,18 @@ CONSOLE_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 _configured = False
 
 
+class RedactingFormatter(logging.Formatter):
+    """Formats as usual, then redacts credentials from any URL or magnet link
+    in the finished line -- message, arguments and traceback alike. Applied
+    to every handler, so no log call site can leak a signed URL's token
+    (?token=, X-Amz-Signature=...) or user:password@ into the log file,
+    which people attach to bug reports."""
+
+    def format(self, record):
+        from adp.utils.url_utils import redact_urls_in_text
+        return redact_urls_in_text(super().format(record))
+
+
 def configure_logging(log_dir: str, file_level=logging.DEBUG, console_level=logging.INFO) -> str:
     """Sets up the root logger with a rotating file handler (verbose, for
     diagnosing issues after the fact) and a console handler (concise, for
@@ -52,7 +64,7 @@ def configure_logging(log_dir: str, file_level=logging.DEBUG, console_level=logg
         log_path, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding="utf-8"
     )
     file_handler.setLevel(file_level)
-    file_handler.setFormatter(logging.Formatter(FILE_FORMAT))
+    file_handler.setFormatter(RedactingFormatter(FILE_FORMAT))
     root.addHandler(file_handler)
 
     # A windowed (non-console) build has sys.stdout/stderr set to None --
@@ -60,7 +72,7 @@ def configure_logging(log_dir: str, file_level=logging.DEBUG, console_level=logg
     if sys.stdout is not None:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(console_level)
-        console_handler.setFormatter(logging.Formatter(CONSOLE_FORMAT))
+        console_handler.setFormatter(RedactingFormatter(CONSOLE_FORMAT))
         root.addHandler(console_handler)
 
     _install_excepthook()

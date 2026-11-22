@@ -45,6 +45,11 @@ DEFAULT_SETTINGS = {
     "torrent_move_completed_dir": "",
     "torrent_move_completed_by_category": False,  # <dir>/<category>/...
     "api_port": 8765,
+    # API trust boundary: what scripts/AI agents using the REST/MCP API may
+    # do. Both off = restricted (public internet only; save only inside the
+    # configured download/torrent folders). The GUI is never restricted.
+    "api_allow_private_network": False,
+    "api_allow_any_save_path": False,
     # Storage locations. Empty string = the built-in default (a folder under
     # the per-user app-data dir). Set these to keep multi-GB downloads off
     # the system drive -- the exact failure that motivated them.

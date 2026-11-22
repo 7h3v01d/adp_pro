@@ -214,3 +214,19 @@ def test_context_menu_index_after_sort(qtbot):
     # Descending: high-seed at row 0. Its result index must resolve to hash b.
     idx = panel._row_result_index(0)
     assert panel._results[idx].infohash == "b" * 40
+
+
+def test_search_tab_discloses_where_queries_go(qtbot):
+    """Review finding 7: searching sends your query to third parties;
+    the tab must say so, distinguishing external from local providers."""
+    from adp.search.service import SearchService
+    from adp.gui.search_panel import SearchPanel
+    service = SearchService(lambda: {"search_providers": {
+        "torrents_csv": {"enabled": True},
+        "jackett": {"enabled": True, "base_url": "http://127.0.0.1:9117", "api_key": "k"},
+    }})
+    panel = SearchPanel(service)
+    qtbot.addWidget(panel)
+    text = panel.privacy_label.text()
+    assert "torrents-csv.com (external service)" in text
+    assert "127.0.0.1:9117 (on this computer)" in text

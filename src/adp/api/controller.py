@@ -29,6 +29,8 @@ from adp.api.bridge import GuiBridge
 from adp.core.models import Status
 from adp.core.storage import ConfiguredPathUnavailableError
 from adp.utils.format import format_size, format_speed
+from adp.utils.url_utils import filename_from_url, sanitize_filename
+from adp.core.net_policy import BlockedDestinationError, check_url
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,51 @@ logger = logging.getLogger(__name__)
 # above any legitimate .torrent (even huge multi-file torrents are well under
 # 1 MiB of metadata).
 MAX_TORRENT_UPLOAD_BYTES = 10 * 1024 * 1024
+# Base64 inflates 3 bytes to 4 chars; the encoded form of the largest
+# acceptable .torrent, checked before decoding anything.
+MAX_TORRENT_BASE64_CHARS = -(-MAX_TORRENT_UPLOAD_BYTES // 3) * 4
+# Hard cap on any API request body (REST and MCP), enforced before the body
+# is parsed: room for a maximum-size base64 .torrent plus JSON overhead.
+MAX_REQUEST_BODY_BYTES = MAX_TORRENT_BASE64_CHARS + 1024 * 1024
+
+# Input length limits. API callers (agents included) are untrusted input;
+# these are far above any legitimate value and cheap to enforce. Shared by
+# the REST schemas and these controller checks (which also cover MCP).
+MAX_URL_CHARS = 16 * 1024
+MAX_MAGNET_CHARS = 64 * 1024
+MAX_PATH_CHARS = 4096
+MAX_NAME_CHARS = 255          # file names
+MAX_CATEGORY_CHARS = 128
+MAX_CHECKSUM_CHARS = 256
+MAX_SEARCH_TEXT_CHARS = 1024
+MAX_PROVIDER_NAME_CHARS = 128
+MAX_PROVIDERS = 32
+MAX_FILE_SELECTION = 100_000
+
+
+# Settings keys for the API trust boundary (both default off = restricted).
+ALLOW_PRIVATE_NETWORK_KEY = "api_allow_private_network"
+ALLOW_ANY_SAVE_PATH_KEY = "api_allow_any_save_path"
+
+
+def is_inside(path: str, root: str, allow_root: bool = False) -> bool:
+    """Is `path` inside `root` once both are fully resolved? realpath()
+    follows symlinks *and* Windows junctions on the existing part of the
+    path, so a link inside the root that points elsewhere doesn't count as
+    inside, and '..' segments can't climb out."""
+    real_path = os.path.normcase(os.path.realpath(path))
+    real_root = os.path.normcase(os.path.realpath(root))
+    try:
+        return os.path.commonpath([real_path, real_root]) == real_root and (
+            allow_root or real_path != real_root)
+    except ValueError:  # different drives on Windows
+        return False
+
+
+def _check_len(field: str, value, limit: int):
+    """422 for a string over its limit (None/absent is fine)."""
+    if value is not None and isinstance(value, str) and len(value) > limit:
+        raise ApiError(f"{field} is too long ({len(value)} characters, max {limit}).", status_code=422)
 
 
 class ApiError(Exception):
@@ -83,17 +130,52 @@ class AppController:
                       num_threads: int = 4, checksum: Optional[str] = None,
                       speed_limit_bps: int = 0, verify_tls: Optional[bool] = None,
                       overwrite: bool = False) -> dict:
+        _check_len("url", url, MAX_URL_CHARS)
+        _check_len("save_path", save_path, MAX_PATH_CHARS)
+        _check_len("category", category, MAX_CATEGORY_CHARS)
+        _check_len("checksum", checksum, MAX_CHECKSUM_CHARS)
+        if url and not self._setting(ALLOW_PRIVATE_NETWORK_KEY):
+            # Fast, explicit refusal for the obvious cases (a literal private
+            # IP, a name resolving to one). Redirects and DNS rebinding are
+            # enforced later, per hop and per connection, by the download's
+            # public-only session.
+            try:
+                check_url(url)
+            except BlockedDestinationError as e:
+                raise ApiError(str(e), status_code=403)
         return self.bridge.call(
             self._add_download_impl, url, save_path, category, num_threads, checksum,
             speed_limit_bps, verify_tls, overwrite
         )
+
+    def _setting(self, key: str) -> bool:
+        panel = self.download_panel
+        settings = getattr(panel, "settings", None) or {}
+        return bool(settings.get(key, False))
+
+    def _require_save_path_inside(self, save_path: str, root: str, what: str, allow_root: bool = False):
+        """API callers may only write inside ADP's configured folder for this
+        kind of transfer, unless the user allowed saving anywhere. (Combined
+        with overwrite=true, an unrestricted path would let an automated
+        caller replace any file the user can write.)"""
+        if self._setting(ALLOW_ANY_SAVE_PATH_KEY):
+            return
+        if not root or not is_inside(save_path, root, allow_root=allow_root):
+            raise ApiError(
+                f"save_path is outside ADP's {what} folder ({root or 'unavailable'}). The API may only "
+                "save inside it; omit save_path to use it, or enable 'Allow API to save anywhere' in "
+                "Settings -> API.", status_code=403)
 
     def _add_download_impl(self, url, save_path, category, num_threads, checksum,
                             speed_limit_bps, verify_tls=None, overwrite=False) -> dict:
         if not url:
             raise ApiError("url is required")
         if not save_path:
-            filename = os.path.basename(url.split("?")[0]) or "download"
+            # Same primitive as the metadata path (Content-Disposition /
+            # final URL): percent-decode, then sanitize -- strips traversal
+            # ("..%2F..%2Fevil.exe"), illegal characters and Windows device
+            # names (CON, AUX...) before anything touches the filesystem.
+            filename = sanitize_filename(filename_from_url(url), fallback="download")
             # Use the SAME destination resolution as the GUI so REST/MCP land
             # files in the user's configured download folder, not the app-data
             # state dir. Fail closed if that folder is unavailable rather than
@@ -103,6 +185,20 @@ class AppController:
             except ConfiguredPathUnavailableError as e:
                 raise ApiError(str(e))
             save_path = os.path.join(base_dir, filename)
+        else:
+            try:
+                root = self.download_panel.resolve_download_dir()
+            except ConfiguredPathUnavailableError:
+                root = None
+            self._require_save_path_inside(save_path, root, "download")
+        # Create the destination's folder (e.g. a new subfolder under
+        # Downloads): the engine opens the file directly and would otherwise
+        # fail. Only reached once the path has passed the boundary check.
+        parent = os.path.dirname(os.path.abspath(save_path))
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise ApiError(f"Couldn't create the destination folder {parent}: {e}")
         # Fail safe on a pre-existing file that isn't a resumable ADP job: an
         # AI/MCP caller supplies paths directly, and silently truncating an
         # unrelated file is unacceptable. Require an explicit overwrite=true.
@@ -115,7 +211,7 @@ class AppController:
         manager, widget = self.download_panel.add_download(
             url=url, save_path=save_path, category=category, num_threads=num_threads,
             checksum=checksum, speed_limit_bps=speed_limit_bps, verify_tls=verify_tls,
-            allow_overwrite=overwrite,
+            allow_overwrite=overwrite, added_via_api=True,
         )
         if manager is None:
             raise ApiError(
@@ -256,6 +352,14 @@ class AppController:
             raise ApiError("Provide either magnet_uri or torrent_file_base64.")
         if magnet_uri and torrent_file_base64:
             raise ApiError("Provide exactly one of magnet_uri or torrent_file_base64, not both.")
+        _check_len("magnet_uri", magnet_uri, MAX_MAGNET_CHARS)
+        _check_len("torrent_file_name", torrent_file_name, MAX_NAME_CHARS)
+        _check_len("save_path", save_path, MAX_PATH_CHARS)
+        _check_len("category", category, MAX_CATEGORY_CHARS)
+        if torrent_file_base64 is not None and len(torrent_file_base64) > MAX_TORRENT_BASE64_CHARS + 4:
+            # Refuse before decoding: a decode of an oversized payload is
+            # exactly the memory spike the limit exists to prevent.
+            raise ApiError(f"torrent file too large (max {MAX_TORRENT_UPLOAD_BYTES} bytes).", status_code=413)
         return self.bridge.call(
             self._add_torrent_impl, magnet_uri, torrent_file_base64, torrent_file_name,
             save_path, category, seed_ratio_limit,
@@ -263,6 +367,10 @@ class AppController:
 
     def _add_torrent_impl(self, magnet_uri, torrent_file_base64, torrent_file_name,
                            save_path, category, seed_ratio_limit) -> dict:
+        if save_path:
+            # A torrent's save_path is a folder: the torrent folder itself is fine.
+            self._require_save_path_inside(save_path, self.torrent_panel.default_save_path, "torrent",
+                                           allow_root=True)
         save_path = save_path or self.torrent_panel.default_save_path
 
         if torrent_file_base64:
@@ -388,6 +496,11 @@ class AppController:
         list) that should be downloaded; every other file in the torrent is
         set to skip."""
         self._require_torrent_support()
+        if not isinstance(selected_indices, (list, tuple)) or len(selected_indices) > MAX_FILE_SELECTION:
+            raise ApiError(f"selected_indices must be a list of at most {MAX_FILE_SELECTION} file indices.",
+                           status_code=422)
+        if not all(isinstance(i, int) and not isinstance(i, bool) and i >= 0 for i in selected_indices):
+            raise ApiError("selected_indices must contain non-negative integers.", status_code=422)
         return self.bridge.call(self._select_torrent_files_impl, torrent_id, selected_indices)
 
     def _select_torrent_files_impl(self, torrent_id, selected_indices) -> dict:
@@ -427,6 +540,7 @@ class AppController:
         if category is not None:
             if not isinstance(category, str) or not category.strip():
                 raise ApiError("category must be a non-empty string.")
+            _check_len("category", category, MAX_CATEGORY_CHARS)
             changes["category"] = category.strip()
         for name, value in (("download_limit_bps", download_limit_bps),
                             ("upload_limit_bps", upload_limit_bps)):
@@ -561,6 +675,13 @@ class AppController:
     def search_torrents(self, text: str, category: Optional[str] = None,
                          providers: Optional[list] = None, limit: int = 50) -> dict:
         self._require_search_support()
+        _check_len("text", text, MAX_SEARCH_TEXT_CHARS)
+        _check_len("category", category, MAX_CATEGORY_CHARS)
+        if providers is not None:
+            if not isinstance(providers, list) or len(providers) > MAX_PROVIDERS:
+                raise ApiError(f"providers must be a list of at most {MAX_PROVIDERS} names.", status_code=422)
+            for name in providers:
+                _check_len("provider name", name, MAX_PROVIDER_NAME_CHARS)
         from adp.search.models import SearchQuery
         try:
             query = SearchQuery(text=text, category=category, providers=providers, limit=limit)

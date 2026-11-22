@@ -124,7 +124,7 @@ def test_settings_are_grouped_into_tabs(qtbot):
     dialog = SettingsDialog(current_settings={})
     qtbot.addWidget(dialog)
     titles = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
-    assert titles == ["General", "Downloads", "Torrents"]
+    assert titles == ["General", "Downloads", "Torrents", "API"]
     page = {t: dialog.tabs.widget(i) for i, t in enumerate(titles)}
     assert page["General"].isAncestorOf(dialog.theme_input)
     assert page["General"].isAncestorOf(dialog.minimize_to_tray_checkbox)
@@ -180,3 +180,17 @@ def test_move_completed_dir_resolution():
     assert f({"torrent_move_completed": True, "torrent_move_completed_dir": "  "}) is None
     assert f({"torrent_move_completed": False, "torrent_move_completed_dir": "E:/Lib"}) is None
     assert f({"torrent_move_completed": True, "torrent_move_completed_dir": "E:/Lib"}) == "E:/Lib"
+
+
+
+def test_api_boundary_settings_default_off_and_round_trip(qtbot):
+    dialog = SettingsDialog(current_settings={})
+    qtbot.addWidget(dialog)
+    out = dialog.get_settings()
+    assert out["api_allow_private_network"] is False
+    assert out["api_allow_any_save_path"] is False
+    dialog.api_private_network_checkbox.setChecked(True)
+    dialog.api_any_path_checkbox.setChecked(True)
+    out = dialog.get_settings()
+    assert out["api_allow_private_network"] is True and out["api_allow_any_save_path"] is True
+    assert dialog.tabs.widget(3).isAncestorOf(dialog.api_private_network_checkbox)

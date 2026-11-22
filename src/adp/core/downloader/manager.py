@@ -20,11 +20,12 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from adp.core.models import Status, category_for_filename
 from adp.core.speed_limiter import SpeedLimiter
-from adp.core.downloader.http import BROWSER_HEADERS
+from adp.core.downloader.http import BROWSER_HEADERS, RemoteFileChangedError
 from adp.core.downloader.workers import (
     DownloadWorker, ChecksumWorker, CleanupWorker,
 )
 from adp.core.downloader.metadata import MetadataFetcher, MetadataFetcherSignals
+from adp.core.net_policy import BlockedDestinationError, PublicOnlySession
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class DownloadManager(QObject):
                  num_threads: int = 4, checksum: Optional[str] = None,
                  headers: Optional[Dict] = None, category: Optional[str] = None,
                  speed_limit_bps: int = 0, verify_tls: bool = True,
-                 allow_overwrite: bool = False):
+                 allow_overwrite: bool = False, added_via_api: bool = False):
         super().__init__()
         self.download_id = download_id
         self.url = url
@@ -58,6 +59,13 @@ class DownloadManager(QObject):
         # user (GUI prompt) or an explicit API overwrite=true has authorized
         # it. Guards against silently destroying an unrelated existing file.
         self.allow_overwrite = allow_overwrite
+        # Downloads added through the REST/MCP API are restricted to public
+        # network addresses (core/net_policy.py) unless the user allows LAN
+        # access. network_policy_allows_private is set by the owning panel to
+        # read the live setting, so ticking it in Settings applies on the
+        # next start/retry. GUI-added downloads are never restricted.
+        self.added_via_api = added_via_api
+        self.network_policy_allows_private = lambda: False
         # Whether ADP itself created/claimed the file at save_path (via a
         # successful preallocation, or by adopting its own valid .progress).
         # This is the basis for retry's overwrite rights: retrying may reuse a
@@ -129,7 +137,7 @@ class DownloadManager(QObject):
                     data = json.load(f)
                 if data.get('url') != self.url or data.get('save_path') != self.save_path:
                     return False
-                if self.server_etag and data.get('etag') != self.server_etag:
+                if not self._saved_progress_matches_server(data):
                     return False
                 # Even without an ETag, a size mismatch means the remote file
                 # changed since the progress was written -- resuming would
@@ -150,6 +158,51 @@ class DownloadManager(QObject):
                 return True
             except (json.JSONDecodeError, KeyError, OSError) as e:
                 logger.error(f"[{self.download_id}] Failed to load progress file: {e}", exc_info=True)
+        return False
+
+    def public_network_only(self) -> bool:
+        return bool(self.added_via_api and not self.network_policy_allows_private())
+
+    def _worker_session_factory(self):
+        """None = the worker's normal session; restricted downloads get a
+        public-only one (checked per redirect hop and per connection)."""
+        if not self.public_network_only():
+            return None
+        return lambda: PublicOnlySession(max_retries=DownloadWorker.default_retries())
+
+    def _metadata_session_factory(self):
+        if not self.public_network_only():
+            return None
+        return lambda retries: PublicOnlySession(max_retries=retries)
+
+    def _saved_progress_matches_server(self, data) -> bool:
+        """Is the file on the server provably the one our partial bytes came
+        from? Resuming onto a different file splices two files together, and
+        a matching size proves nothing. Rules, strongest validator first:
+          * ETag known (saved or now): both must exist and be equal -- an ETag
+            that appeared, disappeared or changed means a different file.
+          * else Last-Modified, same rule.
+          * no validators at all: nothing proves the file is unchanged, so
+            restart -- unless a checksum was given, which verifies the
+            finished file anyway.
+        """
+        saved_etag, saved_lm = data.get('etag'), data.get('last_modified')
+        if saved_etag or self.server_etag:
+            if saved_etag != self.server_etag:
+                logger.warning(f"[{self.download_id}] ETag changed since the partial download "
+                               f"({saved_etag!r} -> {self.server_etag!r}); starting fresh.")
+                return False
+            return True
+        if saved_lm or self.server_last_modified:
+            if saved_lm != self.server_last_modified:
+                logger.warning(f"[{self.download_id}] Last-Modified changed since the partial download "
+                               f"({saved_lm!r} -> {self.server_last_modified!r}); starting fresh.")
+                return False
+            return True
+        if self.checksum:
+            return True
+        logger.warning(f"[{self.download_id}] Server gives no ETag or Last-Modified, so a resume "
+                       "can't be proven safe; starting fresh (supply a checksum to allow resuming).")
         return False
 
     def _write_initial_progress(self):
@@ -218,8 +271,9 @@ class DownloadManager(QObject):
         # still trying to emit a signal on it -- surfacing as
         # "RuntimeError: wrapped C/C++ object ... has been deleted".
         self._metadata_signals = MetadataFetcherSignals()
-        self._metadata_fetcher = MetadataFetcher(self.url, self.headers, self._metadata_signals,
-                                                 verify_tls=self.verify_tls)
+        self._metadata_fetcher = MetadataFetcher(
+            self.url, self.headers, self._metadata_signals, verify_tls=self.verify_tls,
+            session_factory=self._metadata_session_factory())
         self._metadata_signals.metadata_fetched.connect(self.handle_metadata_fetched)
         self._metadata_signals.error_occurred.connect(self.handle_metadata_error)
         self.thread_pool.start(self._metadata_fetcher)
@@ -367,7 +421,9 @@ class DownloadManager(QObject):
         worker = DownloadWorker(self, self.url, self.save_path, start, end, self.headers,
                                  speed_limiter=self.speed_limiter, epoch=self.worker_epoch,
                                  verify_tls=self.verify_tls,
-                                 ranges_supported=getattr(self, 'ranges_supported', True))
+                                 ranges_supported=getattr(self, 'ranges_supported', True),
+                                 etag=self.server_etag, last_modified=self.server_last_modified,
+                                 session_factory=self._worker_session_factory())
         worker.signals.chunk_downloaded.connect(self.on_chunk_downloaded)
         worker.signals.finished.connect(self.on_worker_finished)
         worker.signals.error.connect(self.on_worker_error)
@@ -499,7 +555,12 @@ class DownloadManager(QObject):
                 return
         else:
             exctype, value, tb = error_tuple
-        self.traceback_info = f"{exctype.__name__}: {value}"
+        if isinstance(value, RemoteFileChangedError):
+            self.traceback_info = RemoteFileChangedError.USER_MESSAGE
+        elif isinstance(value, BlockedDestinationError):
+            self.traceback_info = str(value)
+        else:
+            self.traceback_info = f"{exctype.__name__}: {value}"
         logger.error(
             f"[{self.download_id}] Download failed: url={self.url} save_path={self.save_path} "
             f"downloaded={self.downloaded_size}/{self.total_size} -- {self.traceback_info}",

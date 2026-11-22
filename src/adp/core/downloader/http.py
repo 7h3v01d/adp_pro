@@ -68,3 +68,44 @@ def describe_http_error(exc: "requests.RequestException") -> str:
         return ("Couldn't connect to the server. Check the URL and your internet "
                 "connection.")
     return str(exc)
+
+
+class RemoteFileChangedError(RangeNotHonoredError):
+    """The file on the server is no longer the one we started downloading
+    (its ETag/Last-Modified changed, or the server answered our If-Range
+    request with the full new file). Continuing would splice old and new
+    bytes into one corrupt file, so the download stops instead. A Retry
+    starts the new version from scratch (the saved progress no longer
+    matches the server's validators)."""
+
+    USER_MESSAGE = ("The file changed on the server during the download. "
+                    "Retry to download the new version from the start.")
+
+
+def _strip_weak(etag):
+    return etag[2:] if etag and etag.startswith(("W/", "w/")) else etag
+
+
+def if_range_value(etag, last_modified):
+    """The value for an If-Range header, or None. RFC 9110 only allows a
+    *strong* ETag (or an HTTP date) in If-Range -- a weak ETag never matches,
+    which would make every range request fail -- so weak ETags fall back to
+    Last-Modified."""
+    if etag and not etag.startswith(("W/", "w/")):
+        return etag
+    return last_modified or None
+
+
+def validators_match(expected_etag, expected_last_modified, response_headers) -> bool:
+    """Does a response still describe the file we started downloading?
+    Compares the ETag when we have one (weak/strong prefix ignored: proxies
+    sometimes weaken it), else Last-Modified. A validator missing from the
+    response is not treated as a change here -- If-Range plus the 206 checks
+    cover that -- only a *different* value is."""
+    got_etag = response_headers.get('ETag')
+    if expected_etag:
+        return not got_etag or _strip_weak(got_etag) == _strip_weak(expected_etag)
+    got_lm = response_headers.get('Last-Modified')
+    if expected_last_modified:
+        return not got_lm or got_lm == expected_last_modified
+    return True

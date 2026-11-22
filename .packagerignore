@@ -1,0 +1,18 @@
+# --- Excluded Folders --- 
+.old/
+
+# --- Project Packager Files ---
+packit.bat
+project_packager.py
+PACKAGE_MANIFEST.json
+
+# --- Excluded Batch files ---
+doctor.bat
+pip.bat
+run.bat
+shell.bat
+sync.bat
+test.bat
+
+# --- Excluded Misc Files --- 
+

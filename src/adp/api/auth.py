@@ -4,8 +4,13 @@
 the REST/MCP API. The API always binds to 127.0.0.1 only, but a full-control
 API (add/pause/remove downloads and torrents) reachable by *any* local
 process or, worse, a malicious web page via a browser fetch to localhost,
-is a real risk without this -- the key is what turns "any process on this
-machine" into "only whoever has this key".
+is a real risk without this.
+
+Threat boundary, stated precisely: the key protects against *unauthenticated*
+local clients and web-origin (browser) attacks. It does NOT protect against
+hostile software running as the same OS user -- that can read the key file
+(or ADP's memory) like any other file in the user's profile. That limit is
+inherent to local bearer-token auth.
 """
 
 from __future__ import annotations
@@ -49,9 +54,10 @@ class ApiKeyStore:
     def _generate_and_save(self) -> str:
         new_key = secrets.token_urlsafe(32)
         try:
-            # Write with restrictive permissions where the OS supports it;
-            # this file is the only thing standing between "any local
-            # process" and full control of the app.
+            # Owner-only permissions on POSIX. On Windows the mode argument
+            # does not set an ACL; the file is protected only by living in
+            # the user's own profile (%APPDATA%), i.e. readable by any
+            # process running as this user -- see the module docstring.
             fd = os.open(self.key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, 'w') as f:
                 f.write(new_key)

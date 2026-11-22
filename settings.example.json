@@ -18,6 +18,8 @@
   "torrent_move_completed_by_category": false,
 
   "api_port": 8765,
+  "api_allow_private_network": false,
+  "api_allow_any_save_path": false,
 
   "download_dir": "",
   "torrent_download_dir": "",

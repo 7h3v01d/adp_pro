@@ -21,6 +21,8 @@ own Add dialog uses.
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 import logging
 from typing import List, Optional
 
@@ -84,6 +86,23 @@ class SearchPanel(QWidget):
 
     COL_TITLE, COL_SIZE, COL_SEEDERS, COL_LEECHERS, COL_SOURCES, COL_ADD = range(6)
 
+    def _privacy_text(self) -> str:
+        """Names where search queries are sent, marking each destination
+        local (on this machine) or external (a third-party service)."""
+        destinations = []
+        try:
+            providers = self.search_service.enabled_providers()
+        except Exception:  # noqa: BLE001 -- a disclosure label must never break the tab
+            providers = {}
+        for name, provider in providers.items():
+            base = getattr(provider, "base_url", "") or ""
+            host = urlparse(base).netloc or name
+            local = host.split(":")[0] in ("127.0.0.1", "localhost", "::1", "[::1]")
+            destinations.append(f"{host} ({'on this computer' if local else 'external service'})")
+        if not destinations:
+            return ""
+        return "Your search text is sent to: " + ", ".join(destinations)
+
     def __init__(self, search_service: SearchService, torrent_panel=None, parent=None):
         super().__init__(parent)
         self.search_service = search_service
@@ -109,6 +128,12 @@ class SearchPanel(QWidget):
         self.search_button.clicked.connect(self.start_search)
         query_row.addWidget(self.search_button)
         layout.addLayout(query_row)
+
+        # Privacy disclosure: searching is not local -- say where queries go.
+        self.privacy_label = QLabel(self._privacy_text(), self)
+        self.privacy_label.setObjectName("hint")
+        self.privacy_label.setWordWrap(True)
+        layout.addWidget(self.privacy_label)
 
         # -- results table ------------------------------------------------
         self.table = QTableWidget(0, 6, self)

@@ -84,6 +84,8 @@ class DownloadRecord:
     destination_owned_by_adp: bool = False
     restart_required: bool = False
     allow_overwrite: bool = False
+    # Added through the REST/MCP API: subject to the API network policy.
+    added_via_api: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> dict:
@@ -104,6 +106,7 @@ class DownloadRecord:
             "destination_owned_by_adp": self.destination_owned_by_adp,
             "restart_required": self.restart_required,
             "allow_overwrite": self.allow_overwrite,
+            "added_via_api": self.added_via_api,
             "created_at": self.created_at,
         }
 

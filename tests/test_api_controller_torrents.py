@@ -46,7 +46,12 @@ def torrent_panel(make_torrent_panel, tmp_path):
 
 @pytest.fixture
 def controller(bridge, torrent_panel):
-    return AppController(bridge, download_panel=None, torrent_panel=torrent_panel, stats_panel=None)
+    # Torrent-only controller. Settings opt in to saving anywhere: these
+    # tests save into temp folders (the boundary is tested separately).
+    from types import SimpleNamespace
+    settings_holder = SimpleNamespace(settings={"api_allow_any_save_path": True})
+    return AppController(bridge, download_panel=settings_holder, torrent_panel=torrent_panel,
+                         stats_panel=None)
 
 
 def test_add_torrent_does_not_report_transient_paused_state(qtbot, controller, torrent_panel, local_seed, tmp_path):
@@ -263,3 +268,21 @@ def test_start_now_only_for_queued_torrents(qtbot, controller, torrent_panel, lo
         call_from_thread(qtbot, controller.start_torrent_now, torrent_id)
     assert exc_info.value.status_code == 409
     assert call_from_thread(qtbot, controller.get_torrent, torrent_id)["queued"] is False
+
+
+def test_oversized_base64_torrent_rejected_before_decoding(qtbot, controller, monkeypatch):
+    from adp.api.controller import MAX_TORRENT_BASE64_CHARS
+    import base64 as b64mod
+    decoded = []
+    monkeypatch.setattr(b64mod, "b64decode", lambda *a, **k: decoded.append(1) or b"")
+    with pytest.raises(ApiError) as exc_info:
+        controller.add_torrent(torrent_file_base64="A" * (MAX_TORRENT_BASE64_CHARS + 8))
+    assert exc_info.value.status_code == 413
+    assert decoded == []  # never decoded
+
+
+def test_overlong_magnet_rejected(qtbot, controller):
+    from adp.api.controller import MAX_MAGNET_CHARS
+    with pytest.raises(ApiError) as exc_info:
+        controller.add_torrent(magnet_uri="magnet:?xt=urn:btih:" + "a" * MAX_MAGNET_CHARS)
+    assert exc_info.value.status_code == 422

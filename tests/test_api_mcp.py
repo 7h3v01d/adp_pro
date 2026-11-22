@@ -74,6 +74,11 @@ def download_panel(qtbot, tmp_path, thread_pool):
     state_dir.mkdir()
     p = DownloadPanel(state_dir=str(state_dir), thread_pool=thread_pool)
     qtbot.addWidget(p)
+    # These tests download from a local mock server (127.0.0.1) into temp
+    # folders, so they opt in to both API-boundary settings the way a user
+    # would. The boundaries themselves are tested in test_api_trust_boundary.py.
+    p.settings["api_allow_private_network"] = True
+    p.settings["api_allow_any_save_path"] = True
     yield p
     for manager in list(p.downloads.values()):
         if manager.status.is_active or manager.status == Status.PAUSED:
