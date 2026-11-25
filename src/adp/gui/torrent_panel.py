@@ -53,6 +53,9 @@ class TorrentPanel(QWidget):
         self.move_completed_dir = move_completed_dir or None
         self.move_completed_by_category = bool(move_completed_by_category)
         self._seen_downloading = set()
+        # 2.0.3: magnet torrents saved by 2.0.2 or earlier while paused came back with no
+        # file list (stuck at 0%); they're resumed just long enough to fetch it again
+        self._repairing = set()
         self._moves_pending = {}  # torrent_id -> destination folder
         self.session_store = TorrentSessionStore(state_dir)
         # Fail-closed storage: if the user configured a torrent folder that is
@@ -291,6 +294,9 @@ class TorrentPanel(QWidget):
         self._create_list_item(torrent_id, display_name, category)
         self._register_category(category)
         self.apply_filters()
+        # 2.0.3: saved now, not only when the window closes cleanly
+        self.session_store.save_records(list(self.records.values()))
+        self.engine.request_save_resume_data(torrent_id)
         return torrent_id
 
     def _create_list_item(self, torrent_id, name, category):
@@ -350,6 +356,13 @@ class TorrentPanel(QWidget):
             widget.set_name(name)
         logger.info(f"[{torrent_id}] Metadata resolved in GUI: {name} ({total_size} bytes)")
         self._enforce_free_space(torrent_id, name, total_size)
+        if torrent_id in self._repairing:                    # 2.0.3: back to how it was, then check
+            self._repairing.discard(torrent_id)               # what's already on disk
+            self.engine.pause(torrent_id)
+            self.engine.force_recheck(torrent_id)
+        if torrent_id in self.records:                       # 2.0.3: its name and file list, kept now
+            self.session_store.save_records(list(self.records.values()))
+            self.engine.request_save_resume_data(torrent_id)
 
     def _enforce_free_space(self, torrent_id, name, total_size):
         """Metadata time is the first moment a magnet's size is known -- and
@@ -380,6 +393,7 @@ class TorrentPanel(QWidget):
         self.torrent_completed.emit(torrent_id, name)
         self._enforce_stop_on_complete(torrent_id)
         self._maybe_move_completed(torrent_id)
+        self.engine.request_save_resume_data(torrent_id)      # 2.0.3: "finished" survives any restart
 
     # -- moving files ----------------------------------------------------------
     def set_move_completed(self, folder, by_category=False):
@@ -514,6 +528,8 @@ class TorrentPanel(QWidget):
 
     def _on_resume_data_saved(self, torrent_id, data):
         self._pending_resume_data[torrent_id] = data
+        if torrent_id in self.records:                       # 2.0.3: on disk straight away
+            self.session_store.save_resume_data(torrent_id, data)
 
     # -- filtering ----------------------------------------------------------
     def apply_filters(self):
@@ -753,6 +769,7 @@ class TorrentPanel(QWidget):
         self.engine.remove(torrent_id, delete_files=delete_files)
         self.records.pop(torrent_id, None)
         self.session_store.delete_resume_data(torrent_id)
+        self.session_store.save_records(list(self.records.values()))   # 2.0.3: stays removed
         for i in range(self.torrent_list.count()):
             item = self.torrent_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == torrent_id:
@@ -782,6 +799,13 @@ class TorrentPanel(QWidget):
 
             record.torrent_id = torrent_id
             self.records[torrent_id] = record
+            handle = self.engine.handles.get(torrent_id)
+            if resume_data and record.source_magnet and handle is not None and handle.is_valid():
+                status = handle.status()
+                if not status.has_metadata and status.paused:
+                    logger.info(f"[{torrent_id}] Restored paused with no file list; fetching it once")
+                    self._repairing.add(torrent_id)
+                    self.engine.resume(torrent_id)
             self._create_list_item(torrent_id, record.name, record.category)
             self._register_category(record.category)
             if record.download_limit_bps or record.upload_limit_bps:

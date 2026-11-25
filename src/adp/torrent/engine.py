@@ -384,7 +384,13 @@ class TorrentEngine(QObject):
         see TorrentSessionStore.save_all which drives this end to end)."""
         handle = self.handles.get(torrent_id)
         if handle is not None and handle.is_valid():
-            handle.save_resume_data()
+            # 2.0.3: include the torrent's info dict. Without it, a magnet torrent restored
+            # while paused (e.g. stopped at 100%) has no file list and sits at 0% forever.
+            flags = getattr(getattr(lt, "save_resume_flags_t", None), "save_info_dict", None)
+            if flags is not None:
+                handle.save_resume_data(flags)
+            else:
+                handle.save_resume_data()
 
     def request_save_all_resume_data(self):
         for torrent_id in list(self.handles.keys()):

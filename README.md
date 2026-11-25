@@ -117,6 +117,12 @@ seeding" setting; changes apply immediately and are saved with the session.
 - Over MCP, `list_downloads` (HTTP downloads) says when there are torrents too,
   which live in their own list (`list_torrents`), so an assistant asked "how's
   my download going?" doesn't wrongly report nothing (2.0.2)
+- Torrents survive a restart, even one where ADP didn't close cleanly: each
+  torrent is saved when it's added, when its file list arrives and when it
+  finishes, and the saved progress now includes the file list, so a paused
+  magnet torrent no longer comes back stuck at 0%. Magnet torrents saved the
+  old way are resumed once to fetch their file list, then paused and checked
+  against what's already on disk (2.0.3)
 - Only download content you have the right to download
 
 **Stats dashboard** (fourth tab)
