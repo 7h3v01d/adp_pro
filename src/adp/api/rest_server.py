@@ -23,7 +23,7 @@ import json
 import logging
 import threading
 import time
-from typing import Annotated, Optional, List
+from typing import Annotated, Callable, Optional, List
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -353,18 +353,24 @@ class ApiServerRunner:
         return f"http://{self.host}:{self.port}"
 
 
-def start_api_server_with_fallback(app: FastAPI, host: str = "127.0.0.1", preferred_port: int = 8765,
-                                    max_attempts: int = 20) -> ApiServerRunner:
+def start_api_server_with_fallback(make_app: Callable[[], FastAPI], host: str = "127.0.0.1",
+                                    preferred_port: int = 8765, max_attempts: int = 20) -> ApiServerRunner:
     """Tries preferred_port first (the common case, and what users will
     have configured any AI tool/script to expect), and only searches for a
     free port if that one's taken -- e.g. a previous instance of this app
-    still shutting down, or something else already using it."""
+    still shutting down, or something else already using it.
+
+    make_app builds a fresh app for every attempt (2.0.4): uvicorn runs the
+    app's startup before it binds, and the MCP session manager inside can
+    only start once, so reusing one app made every retry fail too."""
     port = preferred_port
     for attempt in range(max_attempts):
-        runner = ApiServerRunner(app, host=host, port=port)
+        runner = ApiServerRunner(make_app(), host=host, port=port)
         if runner.start():
             if port != preferred_port:
-                logger.warning(f"Port {preferred_port} was unavailable; API server started on {port} instead.")
+                logger.warning(f"Port {preferred_port} was unavailable (is another copy of ADP running?); "
+                               f"API server started on {port} instead. Anything set up for "
+                               f"{preferred_port}, such as Dolly, won't reach it until that port is free.")
             return runner
         logger.warning(f"Could not bind API server to {host}:{port} ({runner.start_exception}); trying another port.")
         port += 1

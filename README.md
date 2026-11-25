@@ -123,6 +123,9 @@ seeding" setting; changes apply immediately and are saved with the session.
   magnet torrent no longer comes back stuck at 0%. Magnet torrents saved the
   old way are resumed once to fetch their file list, then paused and checked
   against what's already on disk (2.0.3)
+- If the API port (8765) is taken, for example by another copy of ADP still
+  running, the API now really does start on the next free port, and the log
+  says so. Before, every retry failed and the API didn't start at all (2.0.4)
 - Only download content you have the right to download
 
 **Stats dashboard** (fourth tab)

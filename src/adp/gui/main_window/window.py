@@ -143,10 +143,9 @@ class MainWindow(QMainWindow):
             self.gui_bridge, self.download_panel, self.torrent_panel, self.stats_panel,
             search_service=self.search_service,
         )
-        app = build_app(self.app_controller, self.api_key_store)
         try:
             self.api_server = start_api_server_with_fallback(
-                app, host="127.0.0.1", preferred_port=settings.get("api_port", 8765),
+                lambda: build_app(self.app_controller, self.api_key_store), host="127.0.0.1", preferred_port=settings.get("api_port", 8765),
             )
             logger.info(f"API server listening on {self.api_server.base_url} (REST) "
                         f"and {self.api_server.base_url}/mcp (MCP)")

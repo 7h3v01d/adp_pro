@@ -221,3 +221,37 @@ def test_rest_add_overwrite_true_accepts(qtbot, client, key_store, mock_server, 
         headers=auth_headers(key_store),
     ))
     assert resp.status_code == 200
+
+
+def test_busy_port_falls_back_to_the_next_one_and_it_works(qtbot, bridge, download_panel, key_store):
+    """2.0.3 on Leon's PC: 8765 was taken, and every later port failed too,
+    because the one app's MCP session manager can only start once."""
+    import socket
+    import httpx
+    from adp.api.rest_server import start_api_server_with_fallback
+    controller = AppController(bridge, download_panel, torrent_panel=None, stats_panel=None)
+    busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    busy.bind(("127.0.0.1", 0))
+    busy.listen(1)
+    port = busy.getsockname()[1]
+    runner = None
+    try:
+        runner = start_api_server_with_fallback(lambda: build_app(controller, key_store),
+                                                preferred_port=port, max_attempts=5)
+        assert runner.port != port
+        box = {}
+
+        def hit():
+            box["r"] = httpx.post(f"{runner.base_url}/mcp/", headers={
+                "X-API-Key": key_store.key, "Accept": "application/json, text/event-stream"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "1"}}}, timeout=10)
+        t = threading.Thread(target=hit)
+        t.start()
+        qtbot.waitUntil(lambda: "r" in box, timeout=15000)
+        assert box["r"].status_code == 200, box["r"].text            # MCP really is up
+    finally:
+        busy.close()
+        if runner is not None:
+            runner.stop()
