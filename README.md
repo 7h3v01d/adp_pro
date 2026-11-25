@@ -114,6 +114,9 @@ seeding" setting; changes apply immediately and are saved with the session.
   words), since indexers such as torrents-csv match every word literally.
   The answer's `searched_for` and `note` say which search the results are for
   (2.0.1)
+- Over MCP, `list_downloads` (HTTP downloads) says when there are torrents too,
+  which live in their own list (`list_torrents`), so an assistant asked "how's
+  my download going?" doesn't wrongly report nothing (2.0.2)
 - Only download content you have the right to download
 
 **Stats dashboard** (fourth tab)

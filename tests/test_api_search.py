@@ -198,3 +198,42 @@ def test_mcp_search_tool_tells_the_model_to_use_few_words_and_reports_adps_versi
     tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
     assert "1-3 key words" in tools["search_torrents"].description
     assert mcp._mcp_server.version == __version__
+
+
+
+# ---------------------------------------------------------------------------
+# 2.0.2: list_downloads points at torrents (they're a separate list)
+# ---------------------------------------------------------------------------
+class _TwoLists:
+    def __init__(self, downloads, torrents):
+        self._d, self._t = downloads, torrents
+        self.search_service = None
+
+    def list_downloads(self):
+        return list(self._d)
+
+    def list_torrents(self):
+        if self._t is None:
+            raise ApiError("Torrent support isn't available.", status_code=503)
+        return list(self._t)
+
+
+def _call(mcp, name, args=None):
+    import asyncio
+    import json
+    res = asyncio.run(mcp.call_tool(name, args or {}))
+    blocks = res[0] if isinstance(res, tuple) else res
+    return json.loads(blocks[0].text)
+
+
+def test_list_downloads_says_where_the_torrents_are():
+    from adp.api.mcp_tools import build_mcp_server
+    out = _call(build_mcp_server(_TwoLists([], [{"torrent_id": "ab"}])), "list_downloads")
+    assert out["downloads"] == [] and out["torrents"] == 1
+    assert "list_torrents" in out["note"]
+
+
+def test_list_downloads_without_torrents_or_torrent_support_has_no_note():
+    from adp.api.mcp_tools import build_mcp_server
+    assert "note" not in _call(build_mcp_server(_TwoLists([], [])), "list_downloads")
+    assert "note" not in _call(build_mcp_server(_TwoLists([], None)), "list_downloads")

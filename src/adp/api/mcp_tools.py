@@ -52,12 +52,28 @@ def build_mcp_server(controller: AppController) -> FastMCP:
     if hasattr(mcp, "_mcp_server"):
         mcp._mcp_server.version = __version__
 
+    def _torrent_count() -> int:
+        try:
+            return len(controller.list_torrents())
+        except Exception:  # noqa: BLE001 -- no torrent support: nothing to point at
+            return 0
+
     # -- downloads ----------------------------------------------------------
     @mcp.tool()
     def list_downloads() -> dict:
-        """Lists every HTTP download currently known to the app (any status:
-        downloading, paused, completed, error, stopped)."""
-        return {"downloads": controller.list_downloads()}
+        """Lists every HTTP(S) download currently known to the app (any status:
+        downloading, paused, completed, error, stopped). Torrents are NOT in
+        this list: use list_torrents / get_torrent for those."""
+        out = {"downloads": controller.list_downloads()}
+        # 2.0.2: a model asked "how's my download going?" here, saw an empty list and
+        # said nothing was downloading while a torrent was. Point it at the torrents.
+        torrents = _torrent_count()
+        if torrents:
+            out["torrents"] = torrents
+            out["note"] = (f"There {'is' if torrents == 1 else 'are'} also {torrents} torrent"
+                           f"{'' if torrents == 1 else 's'}, which aren't in this list: use "
+                           "list_torrents or get_torrent to see them.")
+        return out
 
     @mcp.tool()
     def get_download(download_id: str) -> dict:
@@ -116,7 +132,8 @@ def build_mcp_server(controller: AppController) -> FastMCP:
     @mcp.tool()
     def list_torrents() -> dict:
         """Lists every torrent currently known to the app. Fails with a
-        clear error if torrent support isn't available in this install."""
+        clear error if torrent support isn't available in this install.
+        HTTP(S) downloads are separate: use list_downloads for those."""
         return {"torrents": controller.list_torrents()}
 
     @mcp.tool()
