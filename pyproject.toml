@@ -1,6 +1,6 @@
 [project]
 name = "accelerated-downloader-pro"
-version = "2.0.0"
+version = "2.0.1"
 description = "A multi-threaded, resumable download manager with a PyQt6 Pro GUI."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -138,3 +138,63 @@ def test_mcp_server_exposes_search_tools():
     mcp = build_mcp_server(make_controller({"stub": StubProvider("stub", [stub_result()])}))
     tool_names = {t.name for t in anyio.run(mcp.list_tools)}
     assert {"search_torrents", "list_search_providers"} <= tool_names
+
+
+# ---------------------------------------------------------------------------
+# 2.0.1: shorter searches when nothing matches (torrents-csv matches every word)
+# ---------------------------------------------------------------------------
+class OnlyMatches(StubProvider):
+    """Finds something only for one exact search text, like a literal indexer."""
+    def __init__(self, name, wanted):
+        super().__init__(name, [stub_result()])
+        self.wanted = wanted
+        self.seen = []
+
+    def search(self, session, query):
+        self.seen.append(query.text)
+        return list(self._results) if query.text.lower() == self.wanted else []
+
+
+class TestShorterSearches:
+    def test_fallback_queries_drop_filler_then_versions_then_words(self):
+        from adp.search.simplify import fallback_queries
+        assert fallback_queries("Ubuntu 22.04 server ISO") == ["Ubuntu 22.04 server", "Ubuntu server", "Ubuntu"]
+        assert fallback_queries("ubuntu-22.04-server-lts") == ["ubuntu server lts", "ubuntu server", "ubuntu"]
+        assert fallback_queries("debian") == []
+        assert fallback_queries("the iso") == []
+
+    def test_nothing_found_retries_shorter_and_says_so(self):
+        p = OnlyMatches("stub", "ubuntu server")
+        payload = make_controller({"stub": p}).search_torrents(text="Ubuntu 22.04 server ISO")
+        assert payload["count"] == 1
+        assert payload["query"] == "Ubuntu 22.04 server ISO"
+        assert payload["searched_for"] == "Ubuntu server"
+        assert "shorter search" in payload["note"]
+        assert p.seen == ["Ubuntu 22.04 server ISO", "Ubuntu 22.04 server", "Ubuntu server"]
+
+    def test_found_first_time_means_no_retries(self):
+        p = OnlyMatches("stub", "debian")
+        payload = make_controller({"stub": p}).search_torrents(text="debian")
+        assert payload["count"] == 1 and payload["searched_for"] == "debian" and "note" not in payload
+        assert p.seen == ["debian"]
+
+    def test_still_nothing_says_so_and_stops(self):
+        p = OnlyMatches("stub", "never")
+        payload = make_controller({"stub": p}).search_torrents(text="Ubuntu 22.04 server ISO")
+        assert payload["count"] == 0 and "Nothing found" in payload["note"]
+        assert len(p.seen) == 4                                   # the search + at most 3 shorter ones
+
+    def test_no_retries_when_every_provider_failed(self):
+        p = StubProvider("stub", error=ProviderError("stub", "down"))
+        payload = make_controller({"stub": p}).search_torrents(text="Ubuntu 22.04 server ISO")
+        assert payload["tried"] == ["Ubuntu 22.04 server ISO"] and payload["errors"]
+
+
+def test_mcp_search_tool_tells_the_model_to_use_few_words_and_reports_adps_version():
+    import asyncio
+    from adp import __version__
+    from adp.api.mcp_tools import build_mcp_server
+    mcp = build_mcp_server(make_controller({"stub": StubProvider("stub")}))
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    assert "1-3 key words" in tools["search_torrents"].description
+    assert mcp._mcp_server.version == __version__

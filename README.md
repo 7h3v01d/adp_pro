@@ -109,6 +109,11 @@ seeding" setting; changes apply immediately and are saved with the session.
   `search_torrents` MCP tool, so an AI assistant can search, pick, and
   `add_torrent` in one conversation -- same rule as everything else: one
   implementation (`SearchService`) behind every surface
+- Through the API and MCP, a search that finds nothing is retried with shorter
+  searches (filler words like "ISO" and version numbers dropped, then fewer
+  words), since indexers such as torrents-csv match every word literally.
+  The answer's `searched_for` and `note` say which search the results are for
+  (2.0.1)
 - Only download content you have the right to download
 
 **Stats dashboard** (fourth tab)

@@ -47,6 +47,11 @@ def build_mcp_server(controller: AppController) -> FastMCP:
         ),
     )
 
+    # 2.0.1: report ADP's own version, not the MCP library's (FastMCP's default)
+    from adp import __version__
+    if hasattr(mcp, "_mcp_server"):
+        mcp._mcp_server.version = __version__
+
     # -- downloads ----------------------------------------------------------
     @mcp.tool()
     def list_downloads() -> dict:
@@ -203,6 +208,11 @@ def build_mcp_server(controller: AppController) -> FastMCP:
         deduplicated, ranked results (best first). Each result includes a
         `magnet` link that can be passed directly to add_torrent, plus
         seeders/leechers, size_bytes, and which providers reported it.
+        Use 1-3 key words, e.g. "ubuntu server" or "debian netinst": the
+        indexers match every word literally, so version numbers and words
+        like "ISO" or "download" often find nothing. If nothing matches, the
+        app retries with shorter searches by itself; `searched_for` and
+        `note` say which search the results are for.
         `category` is an optional hint: software, audio, video, books,
         games, or other. A failing indexer appears in `errors` and never
         fails the search. Only download content the user has the right to

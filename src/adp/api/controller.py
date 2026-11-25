@@ -694,7 +694,28 @@ class AppController:
                 "provider filter). Enable one under search_providers in settings.",
                 status_code=503,
             )
-        return {"query": text, **outcome.to_dict()}
+        payload = {"query": text, "searched_for": query.text}
+        tried = [query.text]
+        # 2.0.1: nothing found? indexers match every word literally, so try shorter searches
+        # ("ubuntu-22.04-server-lts" -> "ubuntu server"). Not when every provider failed.
+        if not outcome.results and len(outcome.errors) < len(outcome.providers_queried):
+            from adp.search.simplify import fallback_queries
+            for alt in fallback_queries(query.text):
+                tried.append(alt)
+                retry = self.search_service.search(
+                    SearchQuery(text=alt, category=category, providers=providers, limit=limit))
+                if retry.results:
+                    outcome = retry
+                    payload["searched_for"] = alt
+                    payload["note"] = (f"Nothing matched {query.text!r}, so these results are for the "
+                                       f"shorter search {alt!r}.")
+                    break
+            else:
+                payload["note"] = ("Nothing found, even with shorter searches. Try one or two other "
+                                   "key words.")
+        payload["tried"] = tried
+        payload.update(outcome.to_dict())
+        return payload
 
     def list_search_providers(self) -> list:
         self._require_search_support()
